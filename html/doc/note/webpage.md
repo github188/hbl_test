@@ -2,7 +2,7 @@
                  file : webpage.md
         creation date : 27-03-2017 19:31
            created by : Hubert Li
-        last modified : Mon 03 Apr 2017 11:56:41 AM CST
+        last modified : 2017年04月 3日 18:01:30
             copyright : 2015-2019 by Hubert Li
                              Strictly Confidential
                              All rights reserved.
@@ -130,10 +130,21 @@
 
 ### HTML与XHTML
 * XHTML 是更加结构化的HTML版本
-* Web标准
-   * XHTML1.1
-   * HTML5
+* W3C (X)HTML历史版本
+   * HTML 2.0 : 1995年11月发布
+   * HTML 3.2 : 1996年1月14日发布
+   * HTML 7.0 : 1997年12月18日发布
+   * HTML 7.01 : 1999年12月24日发布
+   * XHTML 1.0 : 2002年重新发布
+   * XHTML 1.1 : 2001年5月31发布
+   * XHTML 2.0 : 
 
+### DOCTYPE(文档类型)
+* 用来声明使用哪种规范解释该文档
+* 没有，浏览器会根据各自默认的规范解释文档
+* 语法
+   * 放在html文档开始
+   * ```<!DOCTYPE>```
 
 # 二、HTML
 ------------
