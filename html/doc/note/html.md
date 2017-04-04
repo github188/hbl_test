@@ -2,7 +2,7 @@
                  file : html.md
         creation date : 27-03-2017 19:31
            created by : Hubert Li
-        last modified : Mon 03 Apr 2017 11:54:26 AM CST
+        last modified : 2017年04月 4日 11:52:53
             copyright : 2015-2019 by Hubert Li
                              Strictly Confidential
                              All rights reserved.
@@ -67,6 +67,11 @@
       * 主体标记
       * 放在```<html></html>```标记里,和头标记并行
       * 包含网页所显示的所有内容，是HTML文件的重点
+
+### html注释
+```
+   <!-- 注释内容 -->
+```
 
 ## 2. HTML标记
 * 最基本语法：<标记>内容</标记>
