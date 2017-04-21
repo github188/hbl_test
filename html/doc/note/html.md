@@ -2,7 +2,7 @@
                  file : html.md
         creation date : 27-03-2017 19:31
            created by : Hubert Li
-        last modified : 2017年04月 4日 11:52:53
+        last modified : 2017年04月10日 19:40:20
             copyright : 2015-2019 by Hubert Li
                              Strictly Confidential
                              All rights reserved.
@@ -209,7 +209,7 @@
    * 只支持256色以内图片
    * 采用无损压缩存储
    * 支持透明色，可以使图像浮现在背景之上
-*jpg
+* jpg
    * 静态图像压缩标准格式
    * 有损压缩方案
    * 1670万中颜色
@@ -240,8 +240,7 @@
 ### 文字超链接
 
 ```
-   <a href = "目标地址"> 文本内容 </a>OB
-
+   <a href = "目标地址"> 文本内容 </a>
 ```
 * 两个要素
    * 超链接的文本内容
@@ -366,7 +365,7 @@
    * ```<tr></tr>```       : 定义一行
    * ```<th></th>```       : 该单元格是一行的行头
       * 内容会以粗体显示
-   * ```<td></td>          : 定义一个单元格
+   * ```<td></td>```       : 定义一个单元格
 * 语法
 ```
    <table>
