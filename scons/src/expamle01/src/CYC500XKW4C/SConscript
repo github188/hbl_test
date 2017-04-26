@@ -1,0 +1,19 @@
+﻿#暂时去掉录像功能
+Import('*')
+
+
+env['LIBS'] = ['rt', 'pthread', 'stdc++', 'log', 'ftp', 'xml', 'Gb2312ToUtf8', 'MmsSendH264', 'dctl', 'RecH264','asf','AlarmRecH264','memasf','netManage', 'netDctl', 'ipncRdkMcfw'] 
+
+objs = []
+_o = env.Object(Glob('*.c') + Glob('*.cpp'))
+objs.append(_o)
+
+modules = [ 'syscall', 'sysconf', 'utils', 'protocol', 'netrecv', 'dsp', 'nfsMmc', 'netfscheck', 'rec', 'vidicon', 'ntp', 'onvif']
+#modules = [ 'syscall', 'sysconf', 'utils', 'protocol', 'netrecv', 'dsp', 'nfsMmc', 'netfscheck', 'rawRec']
+
+for subdir in modules:
+   # variant_dir 指定.o输出目录，多级script，似乎是可以累加的
+    o = SConscript('#Main/%s/SConscript' % subdir, variant_dir=subdir, duplicate=0)
+    objs.append(o)
+
+Return('objs')

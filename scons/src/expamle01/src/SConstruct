@@ -1,0 +1,629 @@
+﻿
+# 位于sys.path默认安装目录的模块
+
+# urllib提供一系列用于操作url的功能
+from urllib import urlencode, urlcleanup, quote
+
+# logging是内置的日志模块包
+import logging, logging.handlers
+
+# os，语义为操作系统，所以肯定就是操作系统相关的功能了，可以处理文件和目录这些我们日常手动需要做的操作，就比如说：显示当前目录下所有文件/删除某个文件/获取文件大小……
+# tempfile ,临时文件模块，关闭后自动删除
+import os, tempfile
+
+# httplib是一个相对底层的http请求模块，其上有专门的包装模块，如urllib内建模块，goto等第三方模块
+import httplib
+
+# 当前目录下的模块
+import kjpack
+import fpgapack
+import ramdisk
+import exappRd
+import commit
+import product
+import exapppack
+
+# logging 模块包使用 http://www.jianshu.com/p/feb86c06c4f4
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('')
+record = logging.handlers.RotatingFileHandler('build.log', 'w', 200*1024, 1)
+#record = logging.handlers.TimedRotatingFileHandler('daemon.log', "H", 12, 1)
+record.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+logger.addHandler(record)
+
+def hexchange(input):
+    f = open('a.txt','a')   
+    payload = ""
+    code = ""
+    for i in input:
+        print ord(i)
+        payload += ' '+hex(ord(i))[2:]
+        code += '\\x'+hex(ord(i))[2:]
+    print payload
+    print code
+    print len(input)
+    f.write(code +'\n') 
+    f.write(payload+'\n')
+    f.close()
+
+class localAccess:    
+    def request(self, page, postdata={}, headers={}):
+        daemon = httplib.HTTPConnection('172.16.65.169:9408')
+        
+        if not postdata:
+            daemon.request("GET", '/' + page)
+        else:
+            raise NotImplementedError 
+
+        content = daemon.getresponse()
+        daemon.close()
+        return content.read()
+
+
+class dvsConstruct:
+    def __init__(self, product, gProduct):
+        # get infomation from ini file 
+        toolchains = { \
+        'arm-linux': ('/opt/arm/3.4.1/bin', 'arm-linux-'), \
+        'dm6467': ('/mnt/kj/dm6467/montavista/pro/devkit/arm/v5t_le/bin:/mnt/kj/dm6467/montavista/common/bin:/mnt/kj/dm6467/montavista/pro/bin', 'arm_v5t_le-'), \
+        'dm8127': ('/home/forejolly/anyview/extern_8127/user/local/yourapp/Source/ti_tools/linux_devkit/bin', \
+            'arm-arago-linux-gnueabi-'), \
+        'stolink': ('/usr/local/920t_le/bin', 'arm_920t_le-') \
+        }
+        
+        self.dirPrefix = product + '/'
+        self.info = {}
+        self.info['PRODUCT_DIR'] = product
+        self.info['PRODUCT_NAME'] = product.upper()  # 小写字母转换为大写字母
+        self.info['G_PRODUCT_NAME'] = gProduct.upper()
+        self.info['PackFiles'] = ['uRamdisk']
+        self.info['FpgaFiles'] = []
+        self.info['ExappFiles'] = []
+        
+        # 读入版本信息文件， fpga版本,exapp版本，内核版本，软件版本，硬件版本，
+        self._readLocalDefine()
+
+        logger.debug('before request info is %s', str(self.info))
+        #print(str(self.info))
+        try:
+            #client = localAccess()
+            #data = { 'name': self.info['PRODUCT_NAME'] }
+            #_info = eval(client.request('getinfo?' + urlencode(data)))
+            #print _info
+            if product == "CYC200M":
+                _info = {'BuilderTag': 'dm6467', 'Alarm': '1|0', 'BuildNumber': 1, 'Video': '1|0', 'DeviceCode': '0xA122005F', 'Encode': 'xwmain://*@H264/HD720/2048-6144\r\nxwmain://*@H264/4VGA/2048-6144', 'Audio': '0|0', 'Declare': 'CYC200M-GS', 'Name': 'CYC200M-GS'}
+            elif product == "CYC500XKW4C":
+                _info = {'BuilderTag': 'dm8127', 'Alarm': '1|0', 'BuildNumber、': 1, 'Video': '1|0', 'DeviceCode': '0xA1220077', 'Encode': 'xwmain://*@H264/HD1080/2048-6144\r\nxwmain://*@H264/4VGA/2048-6144', 'Audio': '0|0', 'Declare': 'CYC500X-KW4C', 'Name': 'CYC500X-KW4C'}
+            elif product == "CYC500XAW":
+                _info = {'BuilderTag': 'dm8127', 'Alarm': '1|0', 'BuildNumber': 1, 'Video': '1|0', 'DeviceCode': '0xA1220090', 'Encode': 'xwmain://*@H264/HD1080/2048-6144\r\nxwmain://*@H264/4VGA/2048-6144', 'Audio': '0|0', 'Declare': 'CYC500X-AW', 'Name': 'CYC500X-AW'}
+            else:
+                print 'product is error'
+
+            print _info
+
+            _info['BuilderTag'] = _info['BuilderTag'].strip()
+            logger.debug('%s info response: %s' % (self.info['PRODUCT_NAME'], str(_info)))
+            self.info.update(_info.items())
+            self.info['BuilderTag'] = _info['BuilderTag']
+            self.info['Declare'] = self.info['G_PRODUCT_NAME']
+            self.info['toolchain'] = toolchains[_info['BuilderTag']]
+            ramdisk.hardware = _info['BuilderTag']
+            exappRd.hardware = _info['BuilderTag']
+            ramdisk.product_g = gProduct.upper()
+            logger.debug('after request info is %s', str(self.info))
+        except Exception, e:
+            raise e
+
+    def _updateVerNum(self):
+        _info = open(self.dirPrefix + 'product.inf')
+        _lines = [ tuple(_l.strip().split('=', 1)) for _l in _info.readlines() if _l.strip() and _l[0] != '#' ]
+        _info.close()
+        
+        info = {}
+        info.update(_lines)
+
+        vernums = info['SOFTWARE_VERSION'].split('.',3)
+        
+        vernums[3] = str(int(vernums[3])+1)
+        
+        self.info['VersionString'] = '.'.join(vernums[0:4])
+
+        _verFile = open(self.dirPrefix + 'product_new.inf','w')
+        #打开版本信息文件，自动增加版本号，并保存文件
+        _info = open(self.dirPrefix + 'product.inf')
+        for _l in _info.readlines():
+            obj=_l.find('SOFTWARE_VERSION')
+            if obj==0:
+                _l='SOFTWARE_VERSION'+'='+self.info['VersionString']+'\n'
+                print _l
+            _verFile.write(_l)
+        _info.close()
+        _verFile.close()
+        
+        os.unlink(self.dirPrefix + 'product.inf')
+        os.rename(self.dirPrefix + 'product_new.inf', self.dirPrefix + 'product.inf')
+
+    def _readLocalDefine(self):
+      # 打开版本信息文件， fpga版本,exapp版本，内核版本，软件版本，硬件版本，
+        _info = open(self.dirPrefix + 'product.inf')
+        # tuple 将序列转化为 元祖；strip从字符串里删除字符默认为空格；split将字符串按照'='进行一次分割，分割结果列表保存；
+        _lines = [ tuple(_l.strip().split('=', 1)) for _l in _info.readlines() if _l.strip() and _l[0] != '#' ]
+        _info.close()
+        
+        info = {}
+        # 将_lines字典 -- 添加到指定字典info里的字典。
+        info.update(_lines)
+
+        vernums = info['SOFTWARE_VERSION'].split('.',3)
+        #vernums.extend(['0','0','0','0'])
+
+        self.info['VersionString'] = '.'.join(vernums[0:4])
+        self.info['VersionTag'] = '-'.join(vernums[0:4])
+
+        verint = (int(vernums[0]) << 24) | (int(vernums[1]) << 16) | \
+                (int(vernums[2]) << 8 ) | int(vernums[3])
+        self.info['VersionInt'] = verint
+        
+        if info.has_key('SOFTWARE_MARK') and info['SOFTWARE_MARK']:
+            self.info['VersionString'] += ' [' + info['SOFTWARE_MARK'] + ']'
+        else:
+            self.info['VersionString'] += ' '
+
+        if info.has_key('PRODUCT_DSP_NUMBER') and info['PRODUCT_DSP_NUMBER']:
+            self.info['DspCount'] = int(info['PRODUCT_DSP_NUMBER'])
+        else:
+            self.info['DspCount'] = 1
+
+        if info.has_key('VIDEO_FORMAT') and info['VIDEO_FORMAT']:
+            self.info['VideoFormat'] = info['VIDEO_FORMAT']
+        else:
+            self.info['VideoFormat'] = 'NOH264'
+
+        if info.has_key('EXTRA_PACK') and info['EXTRA_PACK']:
+            self.info['PackFiles'].extend(info['EXTRA_PACK'].split())
+
+        if info.has_key('UIMAGE_RATE') and info['UIMAGE_RATE']:
+            self.info['PackFiles'].extend(info['UIMAGE_RATE'].split())
+            
+        if info.has_key('FPGA_VERSION') and info['FPGA_VERSION']:
+            self.info['FpgaFiles'].extend(info['FPGA_VERSION'].split())
+            
+        if info.has_key('EXAPP_VERSION') and info['EXAPP_VERSION']:
+            self.info['ExappFiles'].extend(info['EXAPP_VERSION'].split())            
+                                              
+        if info.has_key('RAMDISK_SIZE') and info['RAMDISK_SIZE']:
+            ramdisk.ramdiskSize = int(info['RAMDISK_SIZE'])
+
+        if info.has_key('PRODUCT_TARBALLS') and info['PRODUCT_TARBALLS']:
+            ramdisk.tarballs = [ 'default/App/%s.tar.gz' % _ for _ in info['PRODUCT_TARBALLS'].split() ]
+
+        if info.has_key('COMMON_TARBALLS') and info['COMMON_TARBALLS']:
+            ramdisk.commBalls = [ 'CommFile/%s.tar.gz' % _ for _ in info['COMMON_TARBALLS'].split() ]
+
+        if info.has_key('EXAPPRD_SIZE') and info['EXAPPRD_SIZE']:
+            exappRd.ramdiskSize = int(info['EXAPPRD_SIZE'])
+
+        if info.has_key('EXAPP_TARBALLS') and info['EXAPP_TARBALLS']:
+            exappRd.tarballs = [ 'CommFile/%s.tar.gz' % _ for _ in info['EXAPP_TARBALLS'].split() ]
+
+        logger.debug('exappRd size:%d', exappRd.ramdiskSize)
+        logger.debug('exappRd info:%s', str(exappRd.tarballs))
+        
+    def _specBuild(self):
+        # 生成default/App/device.sh 
+        product.genProductEnviron(self.info)
+        product.genProductVersion(self.info)
+        
+    def _mainBuild(self):
+        # 阅读源代码 Tool/cc.py Tool/gcc.py Platform/*.py
+        # 可知在 linux 系统上,  Builder 由 gcc.py 调用 
+        # cc.py 生成, gcc.py 只需修改部分环境变量
+        # 按照同样思路设置 GNU 系列交叉编译工具链的构建环境
+    
+        target = self.dirPrefix + 'xcs'
+        #libpath = ['#/Main/lib/' + self.info['BuilderTag'], '#/'+self.dirPrefix+'lib' ]
+        #add by wangb for 三个产品库都是相同的，故往上挪了一层
+        libpath = [self.info['BuilderTag'], '#/lib' ]
+        cpath = ['#'+self.dirPrefix, '#/Main/include'] 
+        #cflags = '-O2 -DLINUX -DLITTLEENDIAN'
+        #modify by wangb for debug -Wcast-align -Wall  –Werror
+        cflags = ' -DLINUX -DLITTLEENDIAN -g -rdynamic  -DDEBUG -D_BAND_WIDTH_ -Wall'
+        cflags = ' -D'.join([cflags, self.info['VideoFormat']])
+        cflags = ' -D'.join([cflags, self.info['PRODUCT_NAME'], 'PLATFORM_NWGE'])
+        cflags = ' -D'.join([cflags, 'DSP_COUNT=%d' % self.info['DspCount'], \
+          'PRODUCT_CODE=%d' % int(self.info['DeviceCode'][-4:], 16)])
+          
+        _path, _prefix = self.info['toolchain']
+        
+        # 设置环境变量，编译命令目录__init__中设置，库目录：['dm8127', '#/lib']； 代码目录:['#CYC500XKW4C/', '#/Main/include']
+        env = Environment(CC = _prefix + 'gcc', CXX = _prefix + 'g++', STRIP = _prefix + 'strip', CPPPATH=cpath, LIBPATH=libpath)
+        print (111111111111111111111111111111111111111111111111111111)
+        print (cflags)
+        print (env)
+        print (cpath)
+        print (libpath)
+        print (222222222222222222222222222222222222222222222222222222)
+        env.PrependENVPath('PATH', _path) 
+        
+            
+        #  MergeFlags 结果是 compile, link 都使用
+        #    env.MergeFlags(env.ParseFlags()) 
+        # 注意 C++ 使用的是 CXXFLAGS, CPPFLAGS 与 MergeFlags 一个效果
+        env.Append(CFLAGS = cflags)
+        env.Append(CXXFLAGS = cflags)
+       
+      # 似乎是将环境变量，传递给被调用的SConscript
+        Export('env')
+        
+#        objs = []
+#        o = SConscript(self.dirPrefix + 'SConscript', variant_dir=self.dirPrefix + 'default', duplicate=0)
+#        objs.append(o)        
+#        for subdir in modules:
+#            o = SConscript('main/%s/SConscript' % subdir, variant_dir=self.dirPrefix + 'default/%s' % subdir, duplicate=0)
+#            objs.append(o)
+        # variant_dir指定objs输出目录，以SCstruct所在目录为基准
+        objs = SConscript(self.dirPrefix + 'SConscript', variant_dir=self.dirPrefix + 'default', duplicate=0)
+        print target 
+        result = env.Program(target, objs)
+        
+        env.AddPostAction(result, env.Action('$STRIP ' + target))
+
+    def _appBuild(self):        
+        target = self.dirPrefix + 'app'
+        libpath = ['#/'+self.dirPrefix+'lib', '#/app/lib/' + self.info['BuilderTag'] ]
+        cpath = ['#'+self.dirPrefix+'include', '#/app/include'] 
+        #cflags = '-O2 -DLINUX -DLITTLEENDIAN'
+        cflags = '-DLINUX -DLITTLEENDIAN -g -rdynamic  -DDEBUG'
+        cflags = ' -D'.join([cflags, self.info['PRODUCT_NAME'], 'SOFTWARE_VER=0x01030607'])
+        cflags = ' -D'.join([cflags, 'DSP_COUNT=%d' % self.info['DspCount'], \
+          'PRODUCT_CODE=%s' % self.info['DeviceCode']]) #int(self.info['DeviceCode'][-4:], 16)])
+          
+        _path, _prefix = self.info['toolchain']
+        
+        env = Environment(CC = _prefix + 'gcc', CXX = _prefix + 'g++', STRIP = _prefix + 'strip', CPPPATH=cpath, LIBPATH=libpath)
+        env.PrependENVPath('PATH', _path) 
+        
+            
+        #  MergeFlags 结果是 compile, link 都使用
+        #    env.MergeFlags(env.ParseFlags()) 
+        # 注意 C++ 使用的是 CXXFLAGS, CPPFLAGS 与 MergeFlags 一个效果
+        env.Append(CFLAGS = cflags)
+        env.Append(CXXFLAGS = cflags)
+        
+        Export('env')
+
+        mmfs_api = SConscript('app/mmfs/mmfs_api/SConscript')
+        mmfs_app = SConscript('app/mmfs/mmfs_app/SConscript', variant_dir=self.dirPrefix + 'default/mmfs/mmfs_app', duplicate=0)
+        init = SConscript('app/init/SConscript', variant_dir=self.dirPrefix + 'default/init', duplicate=0)
+        dvs = SConscript('app/dvs/SConscript', variant_dir=self.dirPrefix + 'default/dvs', duplicate=0)
+
+        env.Depends(target, mmfs_api)        
+        objs = SConscript(self.dirPrefix + 'SConscript', variant_dir=self.dirPrefix + 'default', duplicate=0)
+        result = env.Program(target, objs)
+        #env.AddPostAction(result, env.Action('$STRIP ' + target))
+
+
+        
+    def _ramdiskBuild(self):
+        try:
+            os.unlink(self.dirPrefix + 'ramdisk.gz')
+            os.unlink(self.dirPrefix + 'uRamdisk')
+        except:
+            print 'unlink fail'
+
+        env = Environment()#ALL_OBJ='default', DIR_TOP='..',PRODUCT_NAME=descProduct['PRODUCT_NAME'], PRODUCT_PLATFORM=descProduct['PRODUCT_PLATFORM'])
+        env.PrependENVPath('PATH', '/home/forejolly/anyview/extern_8127/user/local/yourapp/Source/ti_tools/ipnc_psp_arago/u-boot/tools')  #for mkimage
+
+        os.chdir(self.dirPrefix)
+	print '----------start----prepareTarget----------'
+        ramdisk.prepareTarget()
+	print '----------start----setupTarballs----------'
+        ramdisk.setupTarballs()
+	print '----------start----gzipRamdisk----------'
+        ramdisk.gzipRamdisk(ramdisk.mountDir)
+	print '----------start----convertRamdisk----------'
+        ramdisk.convertRamdisk()
+	print '----------start----mountDir----------'
+        os.rmdir(ramdisk.mountDir)
+        ramdisk.mountDir = 'anything'
+        
+    def _exappRDBuild(self):
+        try:
+            os.unlink(self.dirPrefix + 'exapprd.gz')
+            os.unlink(self.dirPrefix + 'uExappRd')
+        except:
+            print 'unlink fail'
+
+        env = Environment()#ALL_OBJ='default', DIR_TOP='..',PRODUCT_NAME=descProduct['PRODUCT_NAME'], PRODUCT_PLATFORM=descProduct['PRODUCT_PLATFORM'])
+        env.PrependENVPath('PATH', '/mnt/kj/dm6467/montavista/pro/bin')  #for mkimage
+
+        os.chdir(self.dirPrefix)
+        exappRd.prepareTarget()
+        exappRd.setupTarballs()
+        exappRd.gzipRamdisk(exappRd.mountDir)
+        exappRd.convertRamdisk()
+        os.rmdir(exappRd.mountDir)
+        exappRd.mountDir = 'anything'
+
+    def _packageBuild(self):
+        os.chdir(self.dirPrefix)
+        _tempDir = self.info['VersionTag']
+        try:
+            os.mkdir(_tempDir)
+        except:
+            pass
+
+
+        mypack = kjpack.kjpack()
+        mypack.fileName = self.info['G_PRODUCT_NAME'] + '.bin'
+        mypack.devCode = int(self.info['DeviceCode'][-4:], 16)
+        mypack.version = self.info['VersionInt']
+        
+        
+        mypack.files = []
+        
+        for _ in self.info['PackFiles']:
+            sCmp = _.find('uImage')
+            if sCmp == 0:
+                #为了区分cyc200m-gk和cyc200m-gs
+                #sCmp = mypack.fileName.find('-GK')
+                #print sCmp
+                #if sCmp > 0:
+                #    _='uImage_1GK'
+                print _
+                curdir = os.getcwd()
+                len = curdir.rfind('/')
+                commFileDir = curdir[:len]+'/commImage/'+_
+                os.system('cp -fv %s %s/uImage' % (commFileDir, _tempDir))
+                mypack.files.insert(0, commFileDir)
+            else:
+                os.system('cp -fv %s %s/' % (_, _tempDir))
+                mypack.files.append(_)
+        os.system('cp -fv %s %s/' % ('ramdisk.gz', _tempDir))
+        # default os-Linux, chip-arm9, noguard
+        mypack.pack()        
+        os.system('cp -fv %s.bin %s/' % (self.info['G_PRODUCT_NAME'], _tempDir))  
+
+    def _packagebakBuild(self):
+        os.chdir(self.dirPrefix)
+        _tempDir = self.info['VersionTag']
+        try:
+            os.mkdir(_tempDir)
+        except:
+            pass
+
+
+        mypack = kjpack.kjpack()
+        mypack.fileName = self.info['G_PRODUCT_NAME'] + 'BAK.bin'
+        mypack.devCode = int(self.info['DeviceCode'][-4:], 16)
+        mypack.version = self.info['VersionInt']
+        
+        
+        mypack.files = []
+        
+        for _ in self.info['PackFiles']:
+            sCmp = _.find('uImage')
+            if sCmp == 0:
+                print _
+                curdir = os.getcwd()
+                len = curdir.rfind('/')
+                commFileDir = curdir[:len]+'/commImage/'+_
+                os.system('cp -fv %s %s/uImage' % (commFileDir, _tempDir))
+                mypack.files.insert(0, commFileDir)
+            else:
+                os.system('cp -fv %s %s/' % (_, _tempDir))
+                mypack.files.append(_)
+        os.system('cp -fv %s %s/' % ('ramdisk.gz', _tempDir))
+        # default os-Linux, chip-arm9, noguard
+        mypack.pack()
+        os.system('cp -fv %sBAK.bin %s/' % (self.info['G_PRODUCT_NAME'], _tempDir))  
+
+    def _fpgaBuild(self):
+        os.chdir(self.dirPrefix)
+        _tempDir = self.info['VersionTag']
+        try:
+            os.mkdir(_tempDir)
+        except:
+            pass
+
+
+        mepack = fpgapack.fpgapack()
+        mepack.fileName = self.info['G_PRODUCT_NAME'] + '.out'
+        mepack.devCode = int(self.info['DeviceCode'][-4:], 16)
+        mepack.version = self.info['VersionInt']
+        mepack.files = []
+        
+        for _ in self.info['FpgaFiles']:
+            os.system('cp -fv %s %s/ubootFpga.bin' % (_, _tempDir))
+            mepack.files.append(_)
+
+        mepack.pack()
+        os.system('cp -fv %s.out %s/' % (self.info['G_PRODUCT_NAME'], _tempDir))
+
+    def _exappBuild(self):
+        _tempDir = self.info['VersionTag']
+
+        Reserved_Size    = 0x300000
+
+        MTD_TOTAL_SIZE=0x400000
+     
+        file_w = open('./'+_product+'/'+_tempDir+'/'+_gProduct+'.data','wb')
+        file_w.truncate(MTD_TOTAL_SIZE)
+
+        file_r = open('./'+_product+'/'+_tempDir+'/ubootFpga.bin', 'rb')
+        file_len =  os.path.getsize('./'+_product+'/'+_tempDir+'/ubootFpga.bin')
+        
+        tem='%08x'%file_len
+        #hexchange(tem)
+        #print "My name is %s and weight is %x kg!" % ('Zara', file_len) 
+        file_w.write(tem)
+        #file_w.write("%04x"%file_len)
+        file_w.writelines(file_r.readlines())
+        file_r.close()
+        file_w.close()
+
+    def _packageAll(self):
+
+        _tempDir = self.info['VersionTag']
+
+        UBootMin_Size    = 0x20000
+        UBoot_Size       = 0x200000
+        UBootParam_Size  = 0x20000 
+        Kernel_Size      = 0x680000
+        Ramdisk_Size     = 0x3c00000
+        Sys_Size         = 0x1000000
+        Conf_Size        = 0x400000
+        KernelBak_Size   = 0x400000
+        RamdiskBak_Size  = 0xc00000
+        Reserved_Size    = 0x1700000
+
+        MTD_TOTAL_SIZE=0x8000000
+        
+        for _ in self.info['PackFiles']:
+            sCmp = _.find('uImage')
+            if sCmp == 0:
+                _uimage = _
+                print _uimage
+                
+        #os.remove('./'+_product+'/blockall.bin')
+        file_w = open('./'+_product+'/'+_tempDir+'/'+_gProduct+'.data','wb')
+        file_w.truncate(MTD_TOTAL_SIZE)
+
+        file_r = open('./mtdblock0_ubootMin', 'rb')
+        file_len =  os.path.getsize('./mtdblock0_ubootMin')
+        file_w.writelines(file_r.readlines())
+        file_w.seek( file_len, 0)
+        file_w.write('\xFF'*(UBootMin_Size - file_len))
+        file_r.close()
+
+        file_r = open('./mtdblock1_uboot', 'rb')
+        file_len =  os.path.getsize('./mtdblock1_uboot')
+        file_w.writelines(file_r.readlines())
+        file_w.seek( UBootMin_Size+file_len, 0)
+        file_w.write('\xFF'*(UBoot_Size - file_len))
+        file_r.close()
+        
+        file_r = open('./'+_product+'/mtdblock2_uboot_param', 'rb')
+        file_len =  os.path.getsize('./'+_product+'/mtdblock2_uboot_param')
+        file_w.writelines(file_r.readlines())
+        file_w.seek( UBootMin_Size + UBoot_Size+file_len, 0) 
+        file_w.write('\xFF'*(UBootParam_Size - file_len))
+        file_r.close()
+
+        file_r = open('./'+_product+'/'+_tempDir+'/uImage', 'rb')
+        file_len =  os.path.getsize('./'+_product+'/'+_tempDir+'/uImage')
+        file_w.writelines(file_r.readlines())
+        file_w.seek(  UBootMin_Size + UBoot_Size + UBootParam_Size+ file_len, 0) 
+        file_w.write('\xFF'*(Kernel_Size - file_len))
+        file_r.close()
+
+        file_r = open('./'+_product+'/'+_tempDir+'/uRamdisk', 'rb')
+        file_len =  os.path.getsize('./'+_product+'/'+_tempDir+'/uRamdisk')
+        file_w.writelines(file_r.readlines())
+        file_w.seek(  UBootMin_Size + UBoot_Size + UBootParam_Size + Kernel_Size + file_len, 0) 
+        offset = (4 - (file_len + 4) & 0x03)
+        file_w.write('\x00'*offset)
+        file_w.write('\xFF'*(Ramdisk_Size - file_len - offset))
+        file_r.close()
+        
+        file_r = open('./'+_product+'/mtdblock5_app_param', 'rb')
+        file_len =  os.path.getsize('./'+_product+'/mtdblock5_app_param')
+        file_w.writelines(file_r.readlines())
+        file_w.seek(  UBootMin_Size + UBoot_Size + UBootParam_Size + Kernel_Size + Ramdisk_Size + file_len, 0)
+        file_w.write('\xFF'*(Sys_Size - file_len))
+        file_r.close()
+        
+        file_w.write('\xFF'*(Conf_Size))
+        
+        file_r = open('./'+_product+'/'+_tempDir+'/uImage', 'rb')
+        file_len =  os.path.getsize('./'+_product+'/'+_tempDir+'/uImage')
+        file_w.writelines(file_r.readlines())
+        file_w.seek(  UBootMin_Size + UBoot_Size + UBootParam_Size+ Kernel_Size+ Ramdisk_Size + Sys_Size + Conf_Size + file_len, 0) 
+        file_w.write('\xFF'*(KernelBak_Size - file_len))
+        file_r.close()
+        
+        file_r = open('./'+_product+'/'+_tempDir+'/uRamdisk', 'rb')
+        file_len =  os.path.getsize('./'+_product+'/'+_tempDir+'/uRamdisk')
+        file_w.writelines(file_r.readlines())
+        file_w.seek(  UBootMin_Size + UBoot_Size + UBootParam_Size+ Kernel_Size+ Ramdisk_Size + Sys_Size + Conf_Size + KernelBak_Size + file_len, 0)
+        file_w.write('\xFF'*(RamdiskBak_Size - file_len))
+        file_r.close()
+        
+        file_r = open('./'+_product+'/'+_tempDir+'/ubootFpga.bin', 'rb')
+        file_len =  os.path.getsize('./'+_product+'/'+_tempDir+'/ubootFpga.bin')
+        
+        file_w.writelines(file_r.readlines())
+        file_w.seek(  UBootMin_Size + UBoot_Size + UBootParam_Size+ Kernel_Size+ Ramdisk_Size + Sys_Size + Conf_Size + KernelBak_Size + RamdiskBak_Size + file_len, 0)
+        file_w.write('\xFF'*(Reserved_Size - file_len - 4))
+        file_r.close()
+        
+        file_w.close()
+        print '##### create '+_product+' LOW 128M package ok #####'
+
+    def _packageCommit(self):
+        pkgfile = self.info['Name'] + '.bin'
+        os.chdir(self.dirPrefix)
+        
+        if not os.path.exists(pkgfile):
+            print '请先 make package 生成升级包'
+            Exit(0)
+
+        commit.productName = (self.info['Declare'], self.info['Name'])
+        commit.versionTag = self.info['VersionTag']
+
+        curdir = os.getcwd()
+        tmpdir = tempfile.mkdtemp()        
+        logger.debug('temporary working dir:%s', tmpdir)
+
+        os.system('cp -fv %s %s' % (pkgfile, tmpdir))
+
+        os.chdir(tmpdir)
+
+        commit.takeComment()
+        commit.makeRarCommit()
+        
+        os.chdir(curdir)
+        os.system('rm -rf %s' % tmpdir)        
+        
+    def buildTarget(self, target):
+        if target == 'main':
+            self._mainBuild()
+        elif target == 'app':
+            self._appBuild()   
+        elif target == 'ivt':
+            self._ivtBuild()                     
+        elif target == 'spec':
+            self._specBuild()
+#        elif target == 'update':
+#            self._updateBuild()
+        elif target == 'ramdisk':
+            self._ramdiskBuild()
+        elif target == 'exappRD':
+            self._exappRDBuild()
+        elif target == 'package':
+            self._packageBuild()
+        elif target == 'bakpackage':
+            self._packagebakBuild()
+        elif target == 'commit':
+            self._packageCommit()
+        elif target == 'packageAll':
+            self._packageAll()
+        elif target == 'packFpga':
+            self._fpgaBuild()
+        elif target == 'packExapp':
+            self._exappBuild()
+        elif target == 'updateVer':
+            self._updateVerNum()
+
+print "start#############################################"
+_product = ARGUMENTS.get('product')
+_target = ARGUMENTS.get('target', 'main')
+_gProduct = ARGUMENTS.get('gProduct')
+print " _product='%s', _target = '%s' ,_gProduct = %s" % (_product, _target,_gProduct) 
+maker = dvsConstruct(_product, _gProduct)
+maker.buildTarget(_target)
+print "end#############################################"
+#except Exception, e:
+#    print 'error!!!'
+#    raise e
+
