@@ -1,0 +1,4 @@
+﻿Import('*')
+
+_o = env.Object(Glob('*.c') + Glob('*.cpp'))
+Return('_o')

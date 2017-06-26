@@ -1,0 +1,2698 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <semaphore.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <syslog.h>
+#include <pthread.h>
+#include <sys/time.h>
+
+#include "McLog.h"
+#include "dsp.h"
+#include "dsp_service.h"
+
+#include "dsp_define.h"
+
+#include "SysConf.h"
+#include "xcsGlobalDef.h"
+#include "xcsCommDef.h"
+
+#include "MmsSend.h"
+
+#include "JpegSnap.h"
+#include "FtpEpSend.h"
+#include "FtpPpSend.h"
+
+#include "dspParamManage.h"
+#include "SysHandle.h"
+
+#include "Record.h"
+#include "DataUpLoad.h"
+#include "RawRec.h"
+#if defined(CYC200XZD)||defined(CYC500XZD)
+#include "ccdCtl.h"
+#else
+#include "icx274CCDCtl.h"
+#endif
+
+#include "nMCtlApi.h"
+#include "epRecApi.h"
+
+#ifdef MODULE_ONVIF
+
+#include "onvifSend.h"
+#include "memShm.h"
+
+#endif
+
+#ifdef MODULE_NETREC
+
+#include "Storage.h"
+#include "memShm.h"
+
+#endif
+
+
+sem_t sem_dsp;
+sem_t sem_dsp_data;
+
+cam_info_t HDConf = {0};
+
+extern char g_cTemperature;
+extern CDataUpLoad *g_DataReport;
+extern int          g_bTcpDataOk;
+
+extern char g_cOnvifVideoSta;
+extern char g_cNetRecVideoSta;
+
+extern char g_cRecInitSta;
+extern char g_cMmsInitSta;
+extern char g_cFtpInitSta;
+extern char g_cXcsInitSta;
+extern char g_cCCDCtlSta;
+extern char g_cAlarmRecSta;
+
+extern char                 g_bForceRed[MAX_VEHICLE_NUM];   /* Ä£ÄâÍ¨µÀÎªºìµÆ£¬ÓÅÏÈ¼¶×î¸ß£¬Ö»ÒªÎªÕæ¼´±íÊ¾ÎªºìµÆ */
+extern LANE_SWITCH_STA_INFO  g_EPLaneSwitchInfo[MAX_VEHICLE_NUM]; /* µç¾¯³µµÀÇÐ»»×´Ì¬ */
+extern PP_LANE_SWITCH_STA_INFO g_PPLaneSwitchInfo[MAX_VEHICLE_NUM]; /* ¿¨¿Ú³µµÀÇÐ»»×´Ì¬ */
+extern void mainAppShowDate();
+extern int dspEpVLoopStepConf(void);
+extern FtpPpSend *g_CPPFtp;
+
+extern strCXProInfo g_strCXProInfo;
+
+#if defined(CYC800JX)||defined(CYC800XKW4C)
+    #define MAX_JPEG_PIC_LEN 0x200000
+#else
+    #define MAX_JPEG_PIC_LEN 0x180000
+#endif
+
+#define MIN_JPEG_PIC_LEN 0x400
+
+/* Ë®Ó¡ÃÜÂë³¤¶È */
+#define PIC_WATERMARK_PWD_LEN 8
+
+/* µ±ÓÐÐ¡Í¼Æ¬Ê±£¬ÎªÁË·ÀÖ¹·À´Û¸ÄÐÞ¸ÄºóÐøµÄÐ¡Í¼Æ¬£¬ËùÒÔ¼ÓÁËÒ»¶¨µÄ¿ÕÓà¿Õ¼ä */
+#define SMALL_PIC_RESV_ROOM	0x400
+
+#if defined(CYC500XKW4C)||defined(CYC500XAW)
+extern FtpEpSend *g_CEPFtp;
+#endif
+
+
+int *g_debug_level      = NULL;
+int g_dsp_debug_module  = 0xffffffff;
+
+dsp_version_t sharelib_version_info, firmware_version_info, link_ep_version_info, link_lpr_version_info, link_osd_version_info, link_rlt_version_info;
+
+/* ÎªÁË¸ø±¨¾¯Â¼ÏñÌá¹©FTPËùÐèÐÅÏ¢£¬ËùÒÔ²ÉÓÃÈ«¾Ö±äÁ¿±£´æDSPÉÏ´«ÐÅÏ¢ */
+typedef struct tag_gJpegSendInfo
+{
+    int          iAsfSendFlag;
+    JpegSendInfo strEpJSendInfo;
+}GJpedSendInfo;
+
+GJpedSendInfo  g_strEpJSendInfo = {0};
+
+
+/* ×¥ÅÄÍ¼Æ¬Â·¾¶Í³¼ÆÐÅÏ¢½á¹¹ */
+#if defined(CYC200MK)||defined(CYC200K3)||defined(CYC200K2)||defined(CYC200KT)
+extern STR_JPEG_SNAP_COUNT_INFO g_jpegSnapCountInfo[1];
+#elif defined(CYC500K)||defined(CYC500KD)||defined(CYC500KKW2C)
+extern STR_JPEG_SNAP_COUNT_INFO g_jpegSnapCountInfo[MAX_VEHICLE_NUM];
+#else
+extern STR_JPEG_SNAP_COUNT_INFO g_jpegSnapCountInfo[MAX_VEHICLE_NUM];
+#endif
+
+STR_VIDEO_RECSTA g_strVRSta;
+
+int irregRecFileDetail(EP_Alarm_Rec_Frame_Info* pstrAlarmInfo);
+
+#define MATCH_COUNT		500
+#define MAX_NAL_NUM		6
+#define UInt8 unsigned char
+#define UInt32 unsigned int
+#define Int32 int
+UInt32 g_position_length[MAX_NAL_NUM];
+#define ALIGN_4BYTES(x)         (((x) + 3) & (~3))
+int g_pre_bits_rate =4000;
+
+UInt32 shutter_nal(unsigned char *bufVirtAddr,int filledBufSize)
+{
+	UInt8 * tmp_buffer;
+	UInt32 position[6];
+	UInt32 nal_count = 0;
+	UInt32 i = 0;
+	UInt32 match_num = 0;
+
+	if(filledBufSize < MATCH_COUNT)
+		match_num = filledBufSize;
+	else
+		match_num = MATCH_COUNT;
+	
+	tmp_buffer = (UInt8 *)bufVirtAddr ;
+	
+	for(i = 0;i< match_num -4;)
+	{
+		if(tmp_buffer[i] == 0 && tmp_buffer[i+1] == 0 && tmp_buffer[i+2] == 1)
+		{
+			position[nal_count] = i;
+			nal_count ++;
+			i +=3;
+		}
+		else if(tmp_buffer[i] == 0&&tmp_buffer[i+1] == 0&&tmp_buffer[i+2] == 0&&tmp_buffer[i+3] == 1)
+		{
+			position[nal_count] = i;
+			nal_count ++;
+			i +=4;
+		}
+		else
+		{
+			i++;
+		}
+	}
+	if(0 == nal_count)
+	{
+		//A8_SHELL_INFO("ERROR,nal count is %d\n", nal_count);
+	}
+	else
+	{
+		for(i = 0;i< nal_count -1;i++)
+			g_position_length[i] = position[i+1] - position[i];
+		g_position_length[nal_count -1] = filledBufSize - position[nal_count -1];
+	}
+	return nal_count;
+}
+typedef enum {
+
+    VCODEC_FRAME_TYPE_I_FRAME,
+    /**< I-frame or Key Frame */
+
+    VCODEC_FRAME_TYPE_P_FRAME,
+    /**< P-frame */
+
+    VCODEC_FRAME_TYPE_B_FRAME,
+    /**< B-frame */
+
+} VCODEC_FRAME_TYPE_E;
+UInt8 * Add_FrameHeader(unsigned char *addr,UInt8 * dest,int filledBufSize, unsigned int frameType,int* psize )
+{
+#if 1
+DSP_ERROR("##111111##\n");
+	static int seq_num = 0;
+	int header_size = 0;
+	
+	 DSP_ERROR("##111aa2222##\n");
+	TRANSPORT_HEADER  *pTransport_header = NULL;
+	 DSP_ERROR("##111bbb2222##\n");
+	UInt32 frame_end;
+	UInt32 NAL_LENGTH = 0;
+	UInt8 * tmp_buf = NULL;
+	UInt32 nal_num = 0;
+	UInt32 i = 0;
+	UInt32 tmp_positon = 0;
+	UInt32 tmp_index = 0;
+     // * psize = header_size;
+      DSP_ERROR("##111ccc2222##\n");
+	tmp_buf = addr;
+	 DSP_ERROR("##111ddd2222##\n");
+	pTransport_header = (TRANSPORT_HEADER *)(dest);
+	DSP_ERROR("##2222##\n");
+	pTransport_header->venc_data_field.flags = 96;    
+	pTransport_header->venc_data_field.hdr_len = 12;
+	pTransport_header->venc_data_field.reserved = 0;  
+	pTransport_header->venc_data_field.is_cbr = 0;
+	pTransport_header->venc_data_field.bitrate = g_pre_bits_rate;
+	pTransport_header->venc_data_field.is_pal = 1;
+	pTransport_header->venc_data_field.reserved2 = 0;  
+	pTransport_header->venc_data_field.seconds = 0;     
+	DSP_ERROR("##aaaa##\n");
+
+	
+	nal_num = shutter_nal(addr,filledBufSize);
+	if(0 == nal_num)
+	{
+		shell_print("shutter_nal error\n");
+		//return -1;
+		//return;
+	}
+	pTransport_header->nal_header.flag = 0xffffffff;
+	pTransport_header->nal_header.nal_count = nal_num;
+	
+	if(1 == nal_num)
+	{
+		pTransport_header->nal_header.nal_length = filledBufSize;
+		
+		NAL_LENGTH = filledBufSize;
+		
+		memcpy(&dest[sizeof(TRANSPORT_HEADER)],tmp_buf,NAL_LENGTH);
+	}
+	else
+	{
+		pTransport_header->nal_header.nal_length = g_position_length[0];
+		
+		for(i = 0 ; i< nal_num ; i++)
+		{
+			NAL_LENGTH += ALIGN_4BYTES(g_position_length[i]);
+		}
+		
+		NAL_LENGTH += (nal_num - 1)*sizeof(UInt32);
+	}
+	DSP_ERROR("##bbb##\n");
+	pTransport_header->video_data_header.headFlag             = 0x78786A6B;
+	pTransport_header->video_data_header.frameLength = ALIGN_4BYTES(NAL_LENGTH + sizeof(NAL_HEADER));
+	pTransport_header->video_data_header.frameType = (frameType == VCODEC_FRAME_TYPE_I_FRAME)?0x50:0x61;
+	pTransport_header->video_data_header.frameRate =10;//25;
+	pTransport_header->video_data_header.imgFmt = 0xc;
+	pTransport_header->video_data_header.encType = 0x40;  //h264
+	pTransport_header->video_data_header.sequence = seq_num;
+	pTransport_header->video_data_header.timeStamp = 0;//(long long)timestamp;
+	frame_end                                 = 0x6A727962;
+	//#define FRAME_START_CODE_V2            (0x6B6A7878) //kyxx
+	DSP_ERROR("##ccccc##\n");
+	if(nal_num > 1)
+	{
+		
+		memcpy(&dest[sizeof(TRANSPORT_HEADER)],tmp_buf,g_position_length[0]);
+		
+		tmp_index = g_position_length[0];
+		
+		tmp_positon = ALIGN_4BYTES(g_position_length[0]);
+		for(i = 1;i<nal_num;i++)
+		{
+			memcpy(&dest[sizeof(TRANSPORT_HEADER) + tmp_positon + (i -1)*(sizeof(UInt32))],&g_position_length[i],sizeof(UInt32));
+			
+			memcpy(&dest[sizeof(TRANSPORT_HEADER) + tmp_positon + i*sizeof(UInt32)],&tmp_buf[tmp_index],g_position_length[i]);
+			
+			tmp_positon += ALIGN_4BYTES(g_position_length[i]);
+			
+			tmp_index += g_position_length[i];
+		}
+		
+
+	}
+DSP_ERROR("##dddd##\n");
+
+	*psize += sizeof(VENC_DATA_FIELD)+ sizeof(VIDEO_DATA_HEADER) + sizeof(NAL_HEADER);
+	DSP_ERROR("##eee##\n");
+	memcpy(&dest[*psize+ALIGN_4BYTES(NAL_LENGTH)],&frame_end,sizeof(UInt32));
+	DSP_ERROR("##fff##\n");
+	*psize +=ALIGN_4BYTES(NAL_LENGTH) + sizeof(UInt32);
+DSP_ERROR("##ggg##\n");
+	seq_num ++;
+	for(i = 0; i< 10; i++)
+	{
+	DSP_ERROR("##0x%x##\n",dest[i]);
+	}
+	return dest;
+	#endif
+}
+
+#define PBUFFER_LENGTH 960*1024
+ unsigned char * g_Buffer = NULL;
+
+void RcvStreamCallBack(int iChannel, char* pBuffer, unsigned int dwBufSize, unsigned int type)
+//void RcvStreamCallBack(data_param_t *param)
+{
+ DSP_ERROR("-----------zf_addr:%s,%s,%d\t\t rcvStream addr is: 0x%x\n", __FILE__, __FUNCTION__, __LINE__,(unsigned int)pBuffer);
+static char first =1;
+int i;
+ int len = 0;
+ int ret = 0;
+   int head_len = 0;
+  int *prefix_len = &head_len;
+
+  unsigned char *addr =NULL;
+  UInt8 * gbuffer = NULL;
+
+  #if 1
+if(first == 1)
+{
+	g_Buffer =  (unsigned char *)malloc(PBUFFER_LENGTH);
+	first = 0;
+	 DSP_ERROR("##malloc##\n");
+	memset(g_Buffer,0x00,PBUFFER_LENGTH);
+}
+#endif
+//memset(g_Buffer,0x00,PBUFFER_LENGTH);
+  addr = (unsigned char *)pBuffer;
+    len = dwBufSize;
+    	//DSP_ERROR("zf:%s,%s,%d\t buf len=%d .\n", __FILE__, __FUNCTION__, __LINE__, len);
+   
+     // PVENC_DATA_FIELD pstrVencDataField = (PVENC_DATA_FIELD)(addr);
+
+    if(g_cMmsInitSta)
+    {
+    	//DSP_ERROR("########zf:%s,%s,%d\t buf l\n", __FILE__, __FUNCTION__, __LINE__);
+        //ret = MmsDataWrite(chanNo, addr, len, pstrVencDataField->bitrate);
+         DSP_ERROR("%s %d   111##%x\n",__FUNCTION__,__LINE__, g_Buffer[0]);
+        gbuffer = Add_FrameHeader(addr,g_Buffer,dwBufSize,type,prefix_len);
+	 if(prefix_len > 0)
+	 {
+	 //DSP_ERROR("######1111zf:%s,%s,%d\t buf l\n", __FILE__, __FUNCTION__, __LINE__);
+	 for(i = 0; i< 10; i++)
+	 {
+	    DSP_ERROR("%s %d  222 ##%x\n",__FUNCTION__,__LINE__, gbuffer[i]);
+	 }
+         ret = MmsDataWrite(iChannel, gbuffer, *prefix_len, 8000);
+		prefix_len = 0;
+		//DSP_ERROR("######22222zf:%s,%s,%d\t buf l\n", __FILE__, __FUNCTION__, __LINE__);
+	 }
+        if ( 0 != ret )
+        {
+            DSP_ERROR("%s %d mms invalid chanNo %d ret %d.\n",__FUNCTION__,__LINE__,iChannel,ret);
+        }
+        else
+        {
+            // DSP_INFO("%s %d ret valid chanNo %d ret %d.\n",__FUNCTION__,__LINE__,chanNo,ret);
+            g_strVRSta.iVideoSum[iChannel]++;
+        }
+		
+    }
+
+#if 1  //add by fj
+#if 0
+    /* ÎªÁË·ÀÖ¹Â¼ÏñÒì³£ºóÍø¹ÜÆµ·±ÉÏ±¨×´Ì¬£¬ËùÒÔ¼ÇÂ¼Òì³£´ÎÊý */
+    int ret = 0;
+    int len = 0;
+	unsigned int prefix_len = 0;
+    static int touch = 1;
+    //int chanNo = param->chan_id;
+    int chanNo = iChannel;
+    unsigned char *addr =NULL;
+
+	int iAlarmStrLen = sizeof(EP_Alarm_Rec_Frame_Info);
+   unsigned char * g_Buffer;
+    sem_wait(&sem_dsp_data);
+	if(touch == 1)
+	{
+		g_Buffer = test();
+		touch = 0;
+	}
+    //addr = (unsigned char *)(param->buf);
+    addr = (unsigned char *)pBuffer;
+   // if(0 != (unsigned int)addr%4)
+    {
+        DSP_ERROR("-----------zf_addr:%s,%s,%d\t\t rcvStream addr is: 0x%x\n", __FILE__, __FUNCTION__, __LINE__,(unsigned int)addr);
+    }
+    //len = param->buf_len;
+    len = dwBufSize;
+    	//DSP_ERROR("zf:%s,%s,%d\t buf len=%d .\n", __FILE__, __FUNCTION__, __LINE__, len);
+   
+     // PVENC_DATA_FIELD pstrVencDataField = (PVENC_DATA_FIELD)(addr);
+
+    if(g_cMmsInitSta)
+    {
+    	//DSP_ERROR("########zf:%s,%s,%d\t buf l\n", __FILE__, __FUNCTION__, __LINE__);
+        //ret = MmsDataWrite(chanNo, addr, len, pstrVencDataField->bitrate);
+        prefix_len = Add_FrameHeader(addr,g_Buffer,dwBufSize,type);
+	 if(prefix_len > 0)
+	 {
+	 //DSP_ERROR("######1111zf:%s,%s,%d\t buf l\n", __FILE__, __FUNCTION__, __LINE__);
+	    DSP_ERROR("%s %d   ##%x\n",__FUNCTION__,__LINE__, *(int *)g_Buffer);
+        ret = MmsDataWrite(chanNo, g_Buffer, prefix_len, 8000);
+		prefix_len = 0;
+		//DSP_ERROR("######22222zf:%s,%s,%d\t buf l\n", __FILE__, __FUNCTION__, __LINE__);
+	 }
+        if ( 0 != ret )
+        {
+            DSP_ERROR("%s %d mms invalid chanNo %d ret %d.\n",__FUNCTION__,__LINE__,chanNo,ret);
+        }
+        else
+        {
+            // DSP_INFO("%s %d ret valid chanNo %d ret %d.\n",__FUNCTION__,__LINE__,chanNo,ret);
+            g_strVRSta.iVideoSum[chanNo]++;
+        }
+		
+    }
+#endif
+  #if 0 
+#ifdef MODULE_REC
+    if ((chanNo == 0) && (g_cRecInitSta))
+    {
+        ret = RecDataWrite(chanNo,addr+sizeof(VENC_DATA_FIELD), len-sizeof(VENC_DATA_FIELD) );
+        if ( 0!= ret)
+        {
+            DSP_ERROR("%s %d ret invalid chanNo %d ret %d.\n",__FUNCTION__,__LINE__,chanNo,ret);
+        }
+        else
+        {
+            g_strVRSta.iRecSum[chanNo]++;
+        }
+    }
+#endif
+#endif
+
+#if 0
+    long data_len = 0;
+    void *shareBuff = NULL;
+    unsigned char *p_frame = addr;
+#endif
+
+
+#if 0 //#ifdef MODULE_ONVIF
+    static int s_iCount =0;
+    DSP_ERROR("zf:%s,%s,%d\t buf l\n", __FILE__, __FUNCTION__, __LINE__);
+    data_len = (len - sizeof(VENC_DATA_FIELD) + 3)&~0x3; //È·±£Ö¡³¤¶ÈÊÇ4×Ö½Ú¶ÔÆë
+
+    if(chanNo < TOTAL_CHANNEL_NUM)
+    {
+        s_iCount++;
+
+        shareBuff =  memShmMalloc(data_len);
+        if (!shareBuff)
+        {
+        	if( s_iCount % 83 == 0 )
+            {
+            	DSP_ERROR("%s %d DSPCOMM: memShmMalloc failed data_len:%d chan:%d\n", __FUNCTION__, __LINE__, data_len,chanNo);
+				//syslog(LOG_ERR|LOG_USER,"%s %d DSPCOMM: memShmMalloc failed data_len:%d chan:%d\n", __FUNCTION__, __LINE__, data_len,chanNo);
+			}
+            sem_post(&sem_dsp_data);
+            return;
+        }
+        else
+        {
+            if( s_iCount % 83 == 0 )
+            {
+                DSP_INFO("memShmMalloc ok data_len:%d chan:%d\n", data_len,chanNo);
+            }
+        }
+
+        memcpy(shareBuff, p_frame, data_len);
+        //memset(shareBuff, s_iCount, data_len/4);
+        //DSP_INFO("shareBuff data is 0x%x\n", *(int *)shareBuff);
+
+        int offset = memShmOffset(shareBuff);
+    
+        STREAMDATA msg = {0, 0, 0};
+
+    	msg.nChannel = chanNo;
+    	msg.offset = offset;
+     	msg.nLen = data_len;
+
+        ret = args_send( (const char *)&msg, sizeof(msg));
+        if(ret < 0)
+        {
+            memShmFree(shareBuff);
+            if( s_iCount % 83 == 0 )
+            {
+				DSP_INFO("onvif send args message failed, ret:%d, errno:%d,errorstr:%s,reInit socket\n", ret, errno, strerror(errno));		
+          		syslog(LOG_ERR|LOG_USER, "onvif send args message failed, ret:%d, errno:%d,errorstr:%s,reInit socket\n", ret, errno, strerror(errno));		
+			}
+        }
+        else
+        {
+            if( s_iCount % 83 == 0 )
+            {
+                DSP_INFO("onvif args_send ok,count:%d.\n", s_iCount);
+            }
+        }
+    }
+#endif
+
+#if 0 //#ifdef MODULE_NETREC
+    data_len = (len - sizeof(VENC_DATA_FIELD) + 3)&~0x3; //È·±£Ö¡³¤¶ÈÊÇ4×Ö½Ú¶ÔÆë
+DSP_ERROR("zf:%s,%s,%d\t buf l\n", __FILE__, __FUNCTION__, __LINE__);
+    if(chanNo < TOTAL_CHANNEL_NUM)
+    {
+        shareBuff =  memShmMalloc(data_len);
+        if (!shareBuff)
+        {
+            DSP_ERROR("%s %d DSPCOMM: memShmMalloc failed data_len:%d chan:%d\n", __FUNCTION__, __LINE__, data_len,chanNo);
+            sem_post(&sem_dsp_data);
+            return;
+        }
+        else
+        {
+        	DSP_INFO("%s %d DSPCOMM: memShmMalloc ok data_len:%d chan:%d\n", __FUNCTION__, __LINE__, data_len,chanNo);
+        }
+        
+        memcpy(shareBuff, p_frame, data_len);
+
+		ret = StorageDataWrite(chanNo, shareBuff, data_len);
+		if(ret < 0)
+		{
+			DSP_INFO("%s %d chan:%d,StorageDataWrite failed,ret:%d.\n", __FUNCTION__, __LINE__, chanNo, ret);
+			memShmFree(shareBuff);
+		}
+		else
+		{
+			DSP_INFO("%s %d chan:%d,StorageDataWrite ok,ret:%d.\n", __FUNCTION__, __LINE__, chanNo, ret);
+		}
+    }
+#endif
+
+    sem_post(&sem_dsp_data);
+
+
+#else  //add by fj
+
+    /* ÎªÁË·ÀÖ¹Â¼ÏñÒì³£ºóÍø¹ÜÆµ·±ÉÏ±¨×´Ì¬£¬ËùÒÔ¼ÇÂ¼Òì³£´ÎÊý */
+    int ret = 0;
+    int len = 0;
+    //int chanNo = param->chan_id;
+    int chanNo = iChannel;
+    unsigned char *addr =NULL;
+
+	int iAlarmStrLen = sizeof(EP_Alarm_Rec_Frame_Info);
+
+    sem_wait(&sem_dsp_data);
+    //addr = (unsigned char *)(param->buf);
+    addr = (unsigned char *)pBuffer;
+    if(0 != (unsigned int)addr%4)
+    {
+        DSP_ERROR("-----------error:%s,%s,%d\t\t rcvStream addr is: 0x%x\n", __FILE__, __FUNCTION__, __LINE__,(unsigned int)addr);
+    }
+    //len = param->buf_len;
+    len = dwBufSize;
+    if ( len <= sizeof(VENC_DATA_FIELD) + sizeof(VIDEO_DATA_HEADER)+ sizeof(EP_Alarm_Rec_Frame_Info) )
+    {
+    	DSP_ERROR("error:%s,%s,%d\t buf len is too small.\n", __FILE__, __FUNCTION__, __LINE__, len);
+        sem_post(&sem_dsp_data);
+        return;
+    }
+    
+    /* ÓÉÓÚÖ¡Í·Ìí¼ÓÁËÎ¥ÕÂ±¨¾¯½á¹¹Ìå£¬ËùÒÔ»º´æµØÖ·ÐèÒªÍùºóÍ³Ò»Æ«ÒÆ,³¤¶ÈÒ²ÒªÏàÓ¦¼õÉÙ */
+	addr += iAlarmStrLen;
+	len -= iAlarmStrLen;
+
+    //{
+        PVENC_DATA_FIELD pstrVencDataField = (PVENC_DATA_FIELD)(addr);
+        //DSP_INFO("bitrate:%d,flags:%d,is_cbr:%d,is_pal:%d,seconds:%d.\n",pstrVencDataField->bitrate,pstrVencDataField->flags,\
+        //pstrVencDataField->is_cbr,pstrVencDataField->is_pal,pstrVencDataField->seconds);
+        //VIDEO_DATA_HEADER *video_data_header = (PVIDEO_DATA_HEADER)(addr + sizeof(VENC_DATA_FIELD) );
+        //DSP_DEBUG(" chan %d timestamp=%d .\n",chanNo,video_data_header->timeStamp);
+//        
+        #if 0
+        if(0x50 == video_data_header->frameType)
+        {
+            shell_print("package len:0x%x,I frame len is 0x%x\n", len, video_data_header->frameLength);
+            mainAppShowDate();
+        }
+        else
+        {
+            //shell_print("P frame len is 0x%x,ts is 0x%x\n", video_data_header->frameLength, video_data_header->timeStamp);
+        }
+        #endif
+        #if 0
+        char szDefault[256];
+        struct tm tmPlanStart;
+        memset(szDefault,0x00,sizeof(szDefault));
+        
+        gmtime_r((time_t *)&(pstrVencDataField->seconds), &tmPlanStart);
+        sprintf(szDefault,"%04d-%02d-%02d %02d:%02d:%02d",\
+        tmPlanStart.tm_year+1900,tmPlanStart.tm_mon+1,tmPlanStart.tm_mday,\
+        tmPlanStart.tm_hour,tmPlanStart.tm_min,tmPlanStart.tm_sec);
+        shell_print("stream seconds:%s\n", szDefault);
+        DSP_ERROR("timeStamp:0x%x\n", video_data_header->timeStamp);
+        #endif
+        //video_data_header->encType = 0x40;
+//        shell_print(" chan %d len = %d frame len = %d .\n",chanNo,len,video_data_header->frameLength);
+//        shell_print(" chan %d frame head :0x%x frame tail : 0x%x .\n",chanNo,video_data_header->headFlag,frame_tail);
+    //}
+
+    if(g_cMmsInitSta)
+    {
+        ret = MmsDataWrite(chanNo, addr+sizeof(VENC_DATA_FIELD), len-sizeof(VENC_DATA_FIELD), pstrVencDataField->bitrate);
+        if ( 0 != ret )
+        {
+            DSP_ERROR("%s %d mms invalid chanNo %d ret %d.\n",__FUNCTION__,__LINE__,chanNo,ret);
+        }
+        else
+        {
+            // DSP_INFO("%s %d ret valid chanNo %d ret %d.\n",__FUNCTION__,__LINE__,chanNo,ret);
+            g_strVRSta.iVideoSum[chanNo]++;
+        }
+    }
+    
+#ifdef MODULE_REC
+    if ((chanNo == 0) && (g_cRecInitSta))
+    {
+        ret = RecDataWrite(chanNo,addr+sizeof(VENC_DATA_FIELD), len-sizeof(VENC_DATA_FIELD) );
+        if ( 0!= ret)
+        {
+            DSP_ERROR("%s %d ret invalid chanNo %d ret %d.\n",__FUNCTION__,__LINE__,chanNo,ret);
+        }
+        else
+        {
+            g_strVRSta.iRecSum[chanNo]++;
+        }
+    }
+#endif
+
+#ifdef MODULE_ALARMREC
+    #if defined(CYC500XKW4C)||defined(CYC500XAW)
+    if ( (chanNo == 0) && (g_cAlarmRecSta) )
+    {
+		/* ½øÐÐÎ¥ÕÂÐÅÏ¢´¦Àí */
+		EP_Alarm_Rec_Frame_Info* pstrAlarmInfo = NULL;
+
+		pstrAlarmInfo = (EP_Alarm_Rec_Frame_Info *)(pBuffer);
+		irregRecFileDetail(pstrAlarmInfo);
+
+        ret = epRecModuleFrameInput((XCS_FRAME *)(addr+sizeof(VENC_DATA_FIELD)), len-sizeof(VENC_DATA_FIELD) );
+        if ( 0 > ret)
+        {
+            DSP_ERROR("%s %d ep rec failed, ret %d.\n",__FUNCTION__,__LINE__, ret);
+        }
+    }
+    #endif
+#endif
+
+#if 1
+    long data_len = 0;
+    void *shareBuff = NULL;
+    unsigned char *p_frame = addr+sizeof(VENC_DATA_FIELD);
+#endif
+
+#ifdef MODULE_ONVIF
+    static int s_iCount =0;
+    
+    data_len = (len - sizeof(VENC_DATA_FIELD) + 3)&~0x3; //È·±£Ö¡³¤¶ÈÊÇ4×Ö½Ú¶ÔÆë
+
+    if(chanNo < TOTAL_CHANNEL_NUM)
+    {
+        s_iCount++;
+
+        shareBuff =  memShmMalloc(data_len);
+        if (!shareBuff)
+        {
+        	if( s_iCount % 83 == 0 )
+            {
+            	DSP_ERROR("%s %d DSPCOMM: memShmMalloc failed data_len:%d chan:%d\n", __FUNCTION__, __LINE__, data_len,chanNo);
+				//syslog(LOG_ERR|LOG_USER,"%s %d DSPCOMM: memShmMalloc failed data_len:%d chan:%d\n", __FUNCTION__, __LINE__, data_len,chanNo);
+			}
+            sem_post(&sem_dsp_data);
+            return;
+        }
+        else
+        {
+            if( s_iCount % 83 == 0 )
+            {
+                DSP_INFO("memShmMalloc ok data_len:%d chan:%d\n", data_len,chanNo);
+            }
+        }
+
+        memcpy(shareBuff, p_frame, data_len);
+        //memset(shareBuff, s_iCount, data_len/4);
+        //DSP_INFO("shareBuff data is 0x%x\n", *(int *)shareBuff);
+
+        int offset = memShmOffset(shareBuff);
+    
+        STREAMDATA msg = {0, 0, 0};
+
+    	msg.nChannel = chanNo;
+    	msg.offset = offset;
+    	msg.nLen = data_len;
+
+        ret = args_send( (const char *)&msg, sizeof(msg));
+        if(ret < 0)
+        {
+            memShmFree(shareBuff);
+            if( s_iCount % 83 == 0 )
+            {
+				DSP_INFO("onvif send args message failed, ret:%d, errno:%d,errorstr:%s,reInit socket\n", ret, errno, strerror(errno));		
+          		syslog(LOG_ERR|LOG_USER, "onvif send args message failed, ret:%d, errno:%d,errorstr:%s,reInit socket\n", ret, errno, strerror(errno));		
+			}
+        }
+        else
+        {
+            if( s_iCount % 83 == 0 )
+            {
+                DSP_INFO("onvif args_send ok,count:%d.\n", s_iCount);
+            }
+        }
+    }
+#endif
+
+#ifdef MODULE_NETREC
+    data_len = (len - sizeof(VENC_DATA_FIELD) + 3)&~0x3; //È·±£Ö¡³¤¶ÈÊÇ4×Ö½Ú¶ÔÆë
+
+    if(chanNo < TOTAL_CHANNEL_NUM)
+    {
+        shareBuff =  memShmMalloc(data_len);
+        if (!shareBuff)
+        {
+            DSP_ERROR("%s %d DSPCOMM: memShmMalloc failed data_len:%d chan:%d\n", __FUNCTION__, __LINE__, data_len,chanNo);
+            sem_post(&sem_dsp_data);
+            return;
+        }
+        else
+        {
+        	DSP_INFO("%s %d DSPCOMM: memShmMalloc ok data_len:%d chan:%d\n", __FUNCTION__, __LINE__, data_len,chanNo);
+        }
+        
+        memcpy(shareBuff, p_frame, data_len);
+
+		ret = StorageDataWrite(chanNo, shareBuff, data_len);
+		if(ret < 0)
+		{
+			DSP_INFO("%s %d chan:%d,StorageDataWrite failed,ret:%d.\n", __FUNCTION__, __LINE__, chanNo, ret);
+			memShmFree(shareBuff);
+		}
+		else
+		{
+			DSP_INFO("%s %d chan:%d,StorageDataWrite ok,ret:%d.\n", __FUNCTION__, __LINE__, chanNo, ret);
+		}
+    }
+#endif
+
+    sem_post(&sem_dsp_data);
+#endif
+}
+
+
+
+int dspSetTimePos(int chanid,int startX,int startY)
+{
+    int ret;
+    time_param_t param;
+    memset(&param, 0, sizeof(param));
+	param.chan_id = chanid;
+    param.startX = startX;
+    param.startY = startY;
+
+    //sem_wait(&sem_dsp);
+    ret = CALL_CYC_CMD(NET_DEV_SET_OSD_TIME_TITLE, param);
+    //sem_post(&sem_dsp);
+
+    return ret;
+
+}
+
+#if defined(CYC200MK)||defined(CYC200K3)||defined(CYC200K2)||defined(CYC200KT)||defined(CYC500K)||defined(CYC500KD)||defined(CYC500KKW2C)
+static int dspStationConfParam()
+{
+    unsigned int i =0;
+    int ret =0;
+    int chanid = 0;
+
+    ret = camCtlParamRunJudge(CAM_PARAM_MODE_FORCE);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d cam param set.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:camCtlParamRunJudge ok\n");
+    }
+
+    ret = dspEncParamSet(chanid);
+    if( 0!= ret)
+    {
+        DSP_ERROR("error:%s %d enc param set. ret:%d\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:pp enc param set ok\n");
+    }
+    
+    ret = dspSetTimePos(chanid, 0x30, 0x60);   
+    if ( 0!=ret)
+    {
+        DSP_ERROR("%s %d set TimePos ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dspSetTimePos ok");
+    }
+    
+    ret = dspLPRParamSet(0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("%s %d set LPR param ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dspLPRParamSet ok");
+    }
+
+    ret = dspPPIrregNameInfoSet();
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d set pp irregNmae.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspPPIrregNameInfoSet ok\n");
+    }
+
+    ret = dspPpJpgOsdConfSet(0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d dspPpJpgOsdConfSet set.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspPpJpgOsdConfSet ok\n");
+    }
+    
+    for(i =0; i< g_uiClientLaneSum; i++)
+    {
+        ret = dspPPLimitSpeedSet(chanid, i);
+        if ( 0 != ret)
+        {
+            DSP_ERROR("%s %d set Snap limit speed ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+        }
+        else
+        {
+            DSP_INFO("dspPPLimitSpeedSet ok");
+        }
+        ret = dspPPVLParamSet(chanid, i);
+        if ( 0!=ret)
+        {
+            DSP_ERROR("%s %d lane:%d station vl param set,ret=%d error .\n",__FUNCTION__,__LINE__,i, ret);
+        }
+        else
+        {
+            DSP_INFO("lane:%d,Set Station VL Param Ok.\n", i);
+        }
+        ret = dspPPSnapAreaSet(chanid, i);
+        if ( 0!=ret)
+        {
+            DSP_ERROR("%s %d lane:%d, pp snap area set,ret=%d error .\n",__FUNCTION__,__LINE__, i, ret);
+        }
+        else
+        {
+            DSP_INFO("lane:%d Set dspPPSnapAreaSet Ok.\n", i);
+        }
+        ret = dspPPCoilTypeSet(chanid, i);
+        if ( 0!=ret)
+        {
+            DSP_ERROR("%s %d lane:%d,station coil type set,ret=%d error .\n",__FUNCTION__,__LINE__, i, ret);
+        }
+        else
+        {
+            DSP_INFO("lane:%d dspPPCoilTypeSet Ok.\n", i);
+        }
+        ret = dspPPSnapOsdSet(chanid, i);
+        if ( 0 != ret)
+        {
+            DSP_ERROR("%s %d set osdSnap laneId:%d, ret=%d error .\n", __FUNCTION__, __LINE__,i, ret);
+        }
+        else
+        {
+            DSP_INFO("lane:%d,dspPPSnapOsdSet ok!\n", i);
+        }
+        ret = dspPPUnidirLaneTimeSet(chanid, i);
+        if ( 0 != ret)
+        {
+            DSP_ERROR("%s %d set dspPPUnidirLaneTimeSet laneId:%d, ret=%d error .\n", __FUNCTION__, __LINE__,i, ret);
+        }
+        else
+        {
+            DSP_INFO("lane:%d,dspPPUnidirLaneTimeSet ok!\n", i);
+        }
+        
+    }
+    dspPPVSpeedFlagSet();
+
+	ret = dspPpFunEnSet(0,0);
+	if ( 0!=ret)
+	{
+		DSP_ERROR("error:%s %d. ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+	}
+	else
+	{
+	    DSP_INFO("dsp:dspPpFunEnSet ok\n");
+	}
+
+	/* modify by wangb 2010-2-22 for ÎªÁË½ÚÔ¼DSPÐÔÄÜ£¬ÔÚ²»Á¬½ÓÊÓÆµÊ±²»½øÐÐ±àÂë£¬ÈôÓÐÂ¼ÏñÔòÒ»Ö±±àÂë */
+	ret = dspEncStaCtl(chanid, 0);
+	if ( 0!=ret)
+	{
+		DSP_ERROR("%s %d set vstatus ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+	}
+	else
+	{
+	    DSP_INFO("start enc ok\n");
+	}
+	DSP_INFO("Set Station Conf Ok.\n");
+	return 0;
+}
+#endif
+
+
+static int dspFlowRateConf()
+{
+    int iRet =0;
+    unsigned int iLaneId =0;
+    FlowStatInfo strFSInfo;
+    memset(&strFSInfo, 0, sizeof(strFSInfo));
+    iRet = epFlowRateFlagGet();
+    if( iRet > 0 )
+    {
+        iRet = epFlowRateInterGet();
+        strFSInfo.inter_time = 60*iRet;
+        strFSInfo.report_flag = 1;
+        //sem_wait(&sem_dsp);
+        for(iLaneId=0; iLaneId < g_uiCamLaneSum; iLaneId++)
+        {
+            strFSInfo.lane_id = iLaneId;
+            CALL_CYC_CMD(NET_DEV_SET_CAR_FLOWSTAT, strFSInfo);
+        }
+        //sem_post(&sem_dsp);
+    }
+    return iRet;
+}
+
+void epFlowRateHandle(flowstat_status_t *param)
+{
+    int ret =0;
+    JpegSendInfo  strEpJSendInfoTmp;
+    memset(&strEpJSendInfoTmp, 0, sizeof(strEpJSendInfoTmp));
+
+    ELEC_POLICE_VEHICLE_CONF_INFO strEPChanConf;
+    ELEC_POLICE_OVERALL_CONF_INFO strEPGlobalConf;
+    memset(&strEPChanConf, 0, sizeof(strEPChanConf));
+    memset(&strEPGlobalConf, 0, sizeof(strEPGlobalConf));
+    
+    ret = SysConfGet(e_ELEC_POLICE_VEHICLE_CONF, &strEPChanConf, param->lane_id);
+    if ( 0 != ret )
+    {
+        DSP_ERROR("%s %d get ep vehicle conf failed!\n",__FUNCTION__,__LINE__);
+    }
+
+    ret = SysConfGet(e_ELEC_POLICE_OVERALL_CONF, &strEPGlobalConf, param->lane_id);
+    if ( 0 != ret )
+    {
+        DSP_ERROR("%s %d get ep overall conf failed!\n",__FUNCTION__,__LINE__);
+    }
+    
+    sem_wait(&sem_dsp_data);
+    ftpEPLaneNameSet(&strEpJSendInfoTmp, param->lane_id);
+    strEpJSendInfoTmp.iLaneIndex = param->lane_id;
+    strEpJSendInfoTmp.cFileType = TRV_FILE_TYPE;
+    strEpJSendInfoTmp.iPicNum = 0;
+    strEpJSendInfoTmp.uiStatisBeginTime = param->begin_time;
+    strEpJSendInfoTmp.uiStatisEndTime = param->end_time;
+    strEpJSendInfoTmp.uiTrafficVolume = param->flow_num;
+    strEpJSendInfoTmp.uiSnapTimeSecs = param->begin_time;
+    strEpJSendInfoTmp.uiSnapTimeMsSecs = 0;
+
+    strcpy(strEpJSendInfoTmp.szDirectionId, strEPGlobalConf.szDirId);
+    strcpy(strEpJSendInfoTmp.szPortId, strEPGlobalConf.szRoadId);
+    strcpy(strEpJSendInfoTmp.szLaneId, strEPChanConf.szLaneId);
+
+    DSP_INFO("%s %d laneId:%d, flow sum:%d\n",__FUNCTION__,__LINE__, param->lane_id, param->flow_num);
+#if defined(CYC500XKW4C)||defined(CYC500XAW)
+    ret = g_CEPFtp->FtpSendPicture(&strEpJSendInfoTmp);	// tangzl 0725
+    if( !ret )
+    {
+        DSP_ERROR("%s %d ftp send flow rate failed.\n",__FUNCTION__,__LINE__);
+    }
+    else
+    {
+        DSP_INFO("%s %d ftp send flow rate ok.len:%d\n",__FUNCTION__,__LINE__, ret);
+    }
+#endif
+    sem_post(&sem_dsp_data);
+}
+
+static int dspEPoliceConfParam()
+{
+    int ret =0;
+    int chanid = 0;
+
+    ret = dspEncParamSet(chanid);
+    if( 0!= ret)
+    {
+        DSP_ERROR("error:%s %d enc param set. ret:%d\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:ep enc param set ok\n");
+    }
+    ret = dspSetTimePos(chanid, 0x30, 0x60);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("%s %d set TimePos ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    ret = dspEpPpSnapOsdSet(ALL_LANE_SET_MODE, 0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d ep pp snap osd set.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspEpPpSnapOsdSet ok\n");
+    }
+
+	ret = dspLPRParamSet(0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d pp lpr param set.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspLPRParamSet ok\n");
+    }
+
+    ret = dspEpLPRParamSet(0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d ep lpr param set.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspEpLPRParamSet ok\n");
+    }
+
+    ret = dspEpJpgOsdConfSet(0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d dspEpJpgOsdConfSet set.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspEpJpgOsdConfSet ok\n");
+    }
+
+    ret = dspPpJpgOsdConfSet(0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d dspPpJpgOsdConfSet set.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspPpJpgOsdConfSet ok\n");
+    }
+
+    ret = dspEPSnapOsdSet(ALL_LANE_SET_MODE, 0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d ep snap osd set.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspEPSnapOsdSet ok\n");
+    }
+    ret = dspEPRedLightAreaSet(RL_NORMAL_SET_MODE, 0);
+    if ( 0 != ret)
+    {
+        DSP_ERROR("%s %d set red light area ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    } 
+    ret = dspEPVLAreaSet(ALL_LANE_SET_MODE, 0);
+    if ( 0 != ret)
+    {
+        DSP_ERROR("%s %d set virtual coil area ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    } 
+    ret = dspEPLaneAreaSet(ALL_LANE_SET_MODE, 0);
+    if ( 0 != ret)
+    {
+        DSP_ERROR("%s %d set lane area ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    } 
+    
+    ret = camCtlParamRunJudge(CAM_PARAM_MODE_FORCE);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d cam param set.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:camCtlParamRunJudge ok\n");
+    }
+
+    for(unsigned int iLaneId =0; iLaneId < g_uiCamLaneSum; iLaneId++)
+    {
+        epTimeRangeJudge(iLaneId);
+    }
+    ret = dspEPRedLightSet(ALL_LANE_SET_MODE, 0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("%s %d ret=%d error.\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("set red light ok!\n");
+    }
+
+    DSP_INFO("Set Electronic Police Conf Ok,start enc...\n");
+
+    /* Ìí¼ÓÁ÷Á¿Í³¼Æ¼°½û×ó½ûÓÒ¹¦ÄÜ */
+    dspFlowRateConf();
+    //dsp_service_hook_flowstat_control(epFlowRateHandle);
+
+    /* Ìí¼ÓÐéÄâÏßÈ¦×¥ÅÄ²½Êý¼ä¸ôÉèÖÃ */
+    dspEpVLoopStepConf();
+
+    ret = dspEpFuncEn(ALL_LANE_SET_MODE, 0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d. ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspEpFuncEn ok\n");
+    }
+
+    ret = dspEPCoilTypeSet(ALL_LANE_SET_MODE, 0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d coil type set.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspEPCoilTypeSet ok\n");
+    }
+
+    ret = dspPPIrregNameInfoSet();
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d set pp irregNmae.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspPPIrregNameInfoSet ok\n");
+    }
+
+    ret = dspEPIrregNameInfoSet();
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d set ep irregNmae.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspEPIrregNameInfoSet ok\n");
+    }
+
+    ret = dspEPSOTNoEntrySet(ALL_LANE_SET_MODE, 0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("error:%s %d dspEPSOTNoEntrySet.ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("dsp:dspEPSOTNoEntrySet ok\n");
+    }
+
+
+    /* modify by wangb 2010-12-30 for ÎªÁË½ÚÔ¼DSPÐÔÄÜ£¬ÔÚ²»Á¬½ÓÊÓÆµÊ±²»½øÐÐ±àÂë£¬ÈôÓÐÂ¼ÏñÔòÒ»Ö±±àÂë */
+    ret = dspEncStaCtl(chanid, 0);
+    if ( 0!=ret)
+    {
+        DSP_ERROR("%s %d set vstatus ret=%d error .\n",__FUNCTION__,__LINE__,ret);
+    }
+    else
+    {
+        DSP_INFO("start enc ok\n");
+    }
+    
+    return 0;
+}
+
+/******************************************************************************
+ * SendGroupPicToServer() :
+ * 
+ * DESCRIPTION:·¢ËÍÒ»×éÍ¼Æ¬µ½web
+ *  
+ * Input: 
+ * Output: 
+ * Returns: 
+ * 
+ * modification history
+ * --------------------
+ *01a, 2013.12.12, ITS Create
+ * --------------------
+ ******************************************************************************/
+int SendGroupPicToServer(SNAP_INFORM *strPicInfo)
+{
+    INFORM_CONTENT  inform;
+    SNAP_INFORM     snapinform;
+    PASSPORT_SNAP_PARAM ppsnap;
+
+    memset(&inform, 0, sizeof(inform));
+    memset(&snapinform, 0, sizeof(snapinform));
+    memset(&ppsnap, 0, sizeof(ppsnap));
+
+	snapinform = *strPicInfo;
+    
+    inform.strInformParam.uiVersion = 2;
+    inform.strInformParam.uiType    = E_PASSPORT_SNAP;
+    inform.strInformParam.tTime     = 0x12345678;
+    inform.pInformContent = (char *)(&snapinform);
+
+    
+    snapinform.uiParamLen = sizeof(PASSPORT_SNAP_PARAM);
+    snapinform.pucParamData = ( char *)(&ppsnap);
+   
+    memset(&ppsnap,0x00,sizeof(ppsnap));
+    
+    ppsnap.uiSubVersion = 2;
+    ppsnap.usCarLen=10;
+    ppsnap.usSpeed = 100;
+    ppsnap.strLienceArea.usAreaPosX =   0x55;
+    ppsnap.strLienceArea.usAreaPosY =   0x66;
+    ppsnap.strLienceArea.usAreaWidth =  0x77;
+    ppsnap.strLienceArea.usAreaHeight = 0x88;
+    if(g_cXcsInitSta)
+    {
+        g_DataReport->UpLoadData(&inform);   
+    }
+    else
+    {
+        DSP_ERROR("data report init failed\n");
+    }
+    return 0;
+}
+
+/******************************************************************************
+ * SendPicToServer() :
+ * 
+ * DESCRIPTION:  ÓÐÒ»Ð©²ÎÊýÐ´ËÀÁË£¬ÐèÒªµÄ»°¿ÉÒÔ½øÐÐÐÞ¸Ä
+ *  
+ * Input: 
+ * Output: 
+ * Returns: 
+ * 
+ * modification history
+ * --------------------
+ *01a, 2010.01.26, wangbin Create
+ * --------------------
+ ******************************************************************************/
+int SendPicToServer(char *pbuff,unsigned int len)
+{
+    INFORM_CONTENT  inform;
+    SNAP_INFORM     snapinform;
+    PASSPORT_SNAP_PARAM ppsnap;
+
+    memset(&inform, 0, sizeof(inform));
+    memset(&snapinform, 0, sizeof(snapinform));
+    memset(&ppsnap, 0, sizeof(ppsnap));
+    
+    inform.strInformParam.uiVersion = 2;
+    inform.strInformParam.uiType    =E_PASSPORT_SNAP;
+    inform.strInformParam.tTime     = 0x12345678;
+    inform.pInformContent = (char *)(&snapinform);
+
+    
+    snapinform.uiParamLen = sizeof(PASSPORT_SNAP_PARAM);
+    snapinform.pucParamData = ( char *)(&ppsnap);
+    snapinform.ucPicNum     = 1;
+   
+   // len = 100;
+    snapinform.auiPicLen = &len;
+    snapinform.pszPicData   =pbuff;
+  //  strcpy(snapinform.pszPicData[0],buff);
+    
+
+    memset(&ppsnap,0x00,sizeof(ppsnap));
+    
+    ppsnap.uiSubVersion = 2;
+    ppsnap.usCarLen=10;
+    ppsnap.usSpeed = 100;
+    ppsnap.strLienceArea.usAreaPosX =   0x55;
+    ppsnap.strLienceArea.usAreaPosY =   0x66;
+    ppsnap.strLienceArea.usAreaWidth =  0x77;
+    ppsnap.strLienceArea.usAreaHeight = 0x88;
+    if(g_cXcsInitSta)
+    {
+    	printf("#### ·¢ËÍÍ¼Æ¬µ½ÍøÒ³\n");
+        g_DataReport->UpLoadData(&inform);   
+    }
+    else
+    {
+        DSP_ERROR("data report init failed\n");
+    }
+    return 0;
+}
+
+int xcs500xMemAsfFileGet(int iRecType, void **pucBuf)
+{
+    int iFLen =0;
+    int iAsfSta =0;
+    
+    epRecModuleFileExitStaGet(iRecType, &iAsfSta);
+    if(iAsfSta <= 0)
+    {
+        DSP_ERROR("error,%s %d asf file not exit.\n",__FUNCTION__,__LINE__);
+        return -1;
+    }
+    iFLen = epRecModuleMemFileRead(iRecType, pucBuf);
+    if(iFLen > 0)
+    {
+        DSP_INFO("%s %d read ep mem rec file ok,len is %d!\n",__FUNCTION__,__LINE__, iFLen);
+    }
+    else
+    {
+        DSP_INFO("%s %d read ep mem rec file failed,ret is %d!\n",__FUNCTION__,__LINE__, iFLen);
+    }
+    return iFLen;
+}
+
+
+
+
+#if defined(CYC500XKW4C)||defined(CYC500XAW)
+static int XCS500RFillJpegInfo(JpegSendInfo *pStrJSendInfo,VEHICLE_DETECT_HEADER *pVehicleHead,unsigned char ucSnapType)
+{
+    int ret =0;
+    int iPicMixType = dspEpSnapTypeGet(0);
+    ELEC_POLICE_VEHICLE_CONF_INFO strEPChanConf;
+    ELEC_POLICE_OVERALL_CONF_INFO strEPGlobalConf;
+    memset(&strEPChanConf, 0, sizeof(strEPChanConf));
+    memset(&strEPGlobalConf, 0, sizeof(strEPGlobalConf));
+    
+    ret = SysConfGet(e_ELEC_POLICE_VEHICLE_CONF, &strEPChanConf, pVehicleHead->lane);
+    if ( 0 != ret )
+    {
+        DSP_ERROR("%s %d get ep vehicle conf failed!\n",__FUNCTION__,__LINE__);
+        return -1;
+    }
+
+    ret = SysConfGet(e_ELEC_POLICE_OVERALL_CONF, &strEPGlobalConf, pVehicleHead->lane);
+    if ( 0 != ret )
+    {
+        DSP_ERROR("%s %d get ep overall conf failed!\n",__FUNCTION__,__LINE__);
+        return -1;
+    }
+
+    if (SNAP_TYPE_6_PLUS_1 == iPicMixType )
+    {
+        iPicMixType = 6;
+    }
+    else if (( SNAP_TYPE_3_PLUS_1 == iPicMixType) || ( SNAP_TYPE_EP_REVERSE == iPicMixType )\
+    ||( SNAP_TYPE_3_PLUS_1_LEFT == iPicMixType) )
+    {
+        iPicMixType = 3;
+    }
+    else if( SNAP_TYPE_3_SEPARATE == iPicMixType )
+    {
+        iPicMixType = 0;
+    }
+    else if( SNAP_TYPE_4_SEPARATE == iPicMixType )
+    {
+        iPicMixType = 4;
+    }
+    else
+    {
+        iPicMixType = 0;
+    }
+
+    pStrJSendInfo->iCombineType = iPicMixType;
+    /* ÔÝÊ±¹æ¶¨µç¾¯330Æ½Ì¨½ÓÈë³µµÀºÅ¹Ì¶¨Îª3£¬×¢ÒâFTPÄ£¿éÒ²Òª×öÏàÓ¦ÐÞ¸Ä */
+    //pStrJSendInfo->iLaneIndex = 3;
+    pStrJSendInfo->iLaneIndex = pVehicleHead->lane;
+    DSP_INFO("%s %d 500t laneIndex:0x%x.\n",__FUNCTION__,__LINE__, pStrJSendInfo->iLaneIndex);
+    pStrJSendInfo->strParam.pos_info.m_left = pVehicleHead->rect.left;
+    pStrJSendInfo->strParam.pos_info.m_top = pVehicleHead->rect.top;
+    pStrJSendInfo->strParam.pos_info.m_bottom = pVehicleHead->rect.bottom;
+    pStrJSendInfo->strParam.pos_info.m_right = pVehicleHead->rect.right;
+    pStrJSendInfo->strParam.pos_info.m_type = pVehicleHead->vehicleType;
+
+    pStrJSendInfo->strParam.pos_info.m_confidence = pVehicleHead->confidence;
+
+
+    pStrJSendInfo->strParam.SnapPicInfo.ep_snap_info.m_speed = pVehicleHead->speed;
+    pStrJSendInfo->strParam.SnapPicInfo.ep_snap_info.m_speed_thresh = pVehicleHead->maxspeed;
+    
+    pStrJSendInfo->strParam.SnapPicInfo.ep_snap_info.m_redlight_begin = pVehicleHead->redLightSeconds;
+    pStrJSendInfo->strParam.SnapPicInfo.ep_snap_info.m_noturnbegintime = pVehicleHead->redLightSeconds;
+    pStrJSendInfo->strParam.SnapPicInfo.ep_snap_info.m_redlight_duration = pVehicleHead->redLightDuration;
+    pStrJSendInfo->cChanDir = strEPChanConf.cLaneDir;
+    pStrJSendInfo->cFileType = JPG_FILE_TYPE;
+
+    pStrJSendInfo->ucSnapType = ucSnapType;
+
+    strcpy(pStrJSendInfo->szDirectionId, strEPGlobalConf.szDirId);
+    strcpy(pStrJSendInfo->szPortId, strEPGlobalConf.szRoadId);
+    strcpy(pStrJSendInfo->szLaneId, strEPChanConf.szLaneId);
+    pStrJSendInfo->uiXmlType = pVehicleHead->DataType;
+    pStrJSendInfo->cEpPpSelStep0Or1 = eptPpStepNumGet();
+
+    pStrJSendInfo->lpColor        = pVehicleHead->lpColor;
+    pStrJSendInfo->lpConfidenct   = pVehicleHead->lpConfidenct;
+    pStrJSendInfo->lpFCConfidenct = pVehicleHead->lpFCConfidenct;
+    pStrJSendInfo->lpRect.start_x = pVehicleHead->lpRect.left;
+    pStrJSendInfo->lpRect.start_y = pVehicleHead->lpRect.top;
+    pStrJSendInfo->lpRect.width   = pVehicleHead->lpRect.right - pVehicleHead->lpRect.left;
+    pStrJSendInfo->lpRect.height  = pVehicleHead->lpRect.bottom - pVehicleHead->lpRect.top;
+    pStrJSendInfo->LPREnable      = pVehicleHead->LPREnable;
+    pStrJSendInfo->lpType         = pVehicleHead->lpType;
+    strcpy(pStrJSendInfo->lpStr, pVehicleHead->lpStr);
+
+    memcpy( pStrJSendInfo->strSanpPicTime, pVehicleHead->strSnapPicTime, sizeof( pVehicleHead->strSnapPicTime ));
+    /*Start of ×îºóÒ»ÕÅÍ¼Æ¬µÄÊ±¼ä¼õÈ¥ºìµÆÆðÊ¼Ê±¼äÐ¡ÓÚºìµÆ³ÖÐøÊ±¼ä£¬ÔòÐÞ¸ÄºìµÆ³ÖÐøÊ±¼ä ITS on 2012-9-29 15:17 2.0.0.1*/
+
+    if( ( pStrJSendInfo->strSanpPicTime[2].uiSec - pVehicleHead->redLightSeconds ) > pVehicleHead->redLightDuration)
+    {
+        pVehicleHead->redLightDuration = pStrJSendInfo->strSanpPicTime[2].uiSec - pVehicleHead->redLightSeconds +3;
+        pStrJSendInfo->strParam.SnapPicInfo.ep_snap_info.m_redlight_duration = pVehicleHead->redLightDuration;
+    }
+    
+    /*End of ITS on 2012-9-29 15:17 2.0.0.1*/
+    /*
+    DSP_ERROR("%s %d 500t laneIndex:0x%x. dataType:%d.\n",__FUNCTION__,__LINE__, \
+    pStrJSendInfo->iLaneIndex, pVehicleHead->DataType);
+    */
+    //¹ì¼£
+    g_strCXProInfo.cDriverTrack = pVehicleHead->cDriverTrack;//
+    //ÎÂ¶È 
+    g_strCXProInfo.cDevTemprature = g_cTemperature;
+
+    g_strCXProInfo.cLaneId = atoi(strEPChanConf.szLaneId);
+	
+    pStrJSendInfo->strFtpCXProInfo = g_strCXProInfo;
+
+    return 0;
+}
+
+void alarmRecFileSend(char *pcLaneId)
+{
+    int ret =0;
+    char *ppBuf = NULL;
+    JpegSendInfo  strEpJSendInfoTmp;
+#ifdef MODULE_ALARMREC
+    if(g_cAlarmRecSta)
+    {
+        strEpJSendInfoTmp = g_strEpJSendInfo.strEpJSendInfo;
+        //epRecModuleRecStaSet(EP_REC_TYPE, EP_REC_STATE_END, ucLaneId);
+        ret = xcs500xMemAsfFileGet(EP_REC_TYPE, (void **)&ppBuf);
+        if(0 < ret)
+        {
+            strEpJSendInfoTmp.cFileType = ASF_FILE_TYPE;
+            strEpJSendInfoTmp.pcPicBuf = ppBuf;
+            strEpJSendInfoTmp.iCurrPicIndex = strEpJSendInfoTmp.iPicNum;
+            strEpJSendInfoTmp.auiPicLen[strEpJSendInfoTmp.iCurrPicIndex] = ret;
+            //if( g_strEpJSendInfo.iAsfSendFlag == 1)
+            {
+                ret = g_CEPFtp->FtpSendPicture(&strEpJSendInfoTmp);	// tangzl 0725
+                if( !ret )
+                {
+                    DSP_INFO("lane_%d send asf file failed.fileType:%d,index:%d,picNumSum:%d,groupId:%d,file_len:%d\n", \
+                    strEpJSendInfoTmp.iLaneIndex, strEpJSendInfoTmp.cFileType, \
+                    strEpJSendInfoTmp.iCurrPicIndex,strEpJSendInfoTmp.iPicNum,\
+                    strEpJSendInfoTmp.iGroupId,\
+                    strEpJSendInfoTmp.auiPicLen[strEpJSendInfoTmp.iCurrPicIndex]);
+                }
+                else
+                {
+                    DSP_INFO("lane_%d send asf file ok.fileType:%d,index:%d,picNumSum:%d,groupId:%d,file_len:%d\n", \
+                    strEpJSendInfoTmp.iLaneIndex, strEpJSendInfoTmp.cFileType, \
+                    strEpJSendInfoTmp.iCurrPicIndex,strEpJSendInfoTmp.iPicNum,\
+                    strEpJSendInfoTmp.iGroupId,\
+                    strEpJSendInfoTmp.auiPicLen[strEpJSendInfoTmp.iCurrPicIndex]);
+                }
+            }
+            /* É¾³ýasfÎÄ¼þ */
+            epRecModuleFileExitStaSet(EP_REC_TYPE, 0);
+            //g_strEpJSendInfo.iAsfSendFlag = 0;
+        }
+        else
+        {
+            DSP_INFO("%s %d first get asf file failed.\n",__FUNCTION__,__LINE__);
+        }
+    }
+#endif /* MODULE_ALARMREC */
+}
+
+int irregRecFileDetail(EP_Alarm_Rec_Frame_Info* pstrAlarmInfo)
+{
+	int i =0;
+    int iRecSta =0;
+    unsigned char ucLaneId =0;
+    JpegSendInfo strCurSnapInfo;
+
+	memset(&strCurSnapInfo, 0, sizeof(strCurSnapInfo));
+	
+	if(pstrAlarmInfo == NULL)
+	{
+		DSP_ERROR("%s %d inparam is null,dir return.\n",__FUNCTION__,__LINE__);
+		return -1;
+	}
+	if( pstrAlarmInfo->iCarSum <= 0)
+	{
+		//DSP_ERROR("%s %d inparam is null,dir return.\n",__FUNCTION__,__LINE__);
+		return 0;
+	}
+	else
+	{
+		for(i=0; i< pstrAlarmInfo->iCarSum; i++)
+		{
+			DSP_INFO("%s %d carNo:%d,iCarSum:%d,lane:%d,snapTimeSec:%d,snapTimeMsec:%d,goupId:%d,picNum:%d,irregFlag:%d.\n",\
+			__FUNCTION__,__LINE__,i,pstrAlarmInfo->iCarSum,\
+			pstrAlarmInfo->aStrCarInfo[i].uiLane,\
+			pstrAlarmInfo->aStrCarInfo[i].uiSnapSeconds,\
+			pstrAlarmInfo->aStrCarInfo[i].uiSnapMSeconds,\
+			pstrAlarmInfo->aStrCarInfo[i].uiSnapGroup,\
+			pstrAlarmInfo->aStrCarInfo[i].uiSnapPicSum,\
+			pstrAlarmInfo->aStrCarInfo[i].uiIrregFlag);
+			
+	        if( pstrAlarmInfo->aStrCarInfo[i].uiIrregFlag > 0 )
+	        {
+				ucLaneId = pstrAlarmInfo->aStrCarInfo[i].uiLane;
+			    ftpEPLaneNameSet(&strCurSnapInfo, ucLaneId);
+				strCurSnapInfo.iLaneIndex = pstrAlarmInfo->aStrCarInfo[i].uiLane;
+				strCurSnapInfo.uiSnapTimeSecs = pstrAlarmInfo->aStrCarInfo[i].uiSnapSeconds;
+				strCurSnapInfo.uiSnapTimeMsSecs = pstrAlarmInfo->aStrCarInfo[i].uiSnapMSeconds;
+				strCurSnapInfo.iGroupId = pstrAlarmInfo->aStrCarInfo[i].uiSnapGroup;
+				strCurSnapInfo.iPicNum = pstrAlarmInfo->aStrCarInfo[i].uiSnapPicSum;
+				strCurSnapInfo.uiXmlType = pstrAlarmInfo->aStrCarInfo[i].uiIrregFlag;
+				
+	            epRecModuleRecStaGet(EP_REC_TYPE, &iRecSta, ucLaneId);
+	            DSP_INFO("%s %d lane:%d alarm rec sta is %d\n", __FUNCTION__,__LINE__,ucLaneId, iRecSta);
+	            
+	            if(iRecSta == EP_REC_STATE_BEGIN)
+	            {
+	                /* ÏÈ½áÊøÉÏ´Î±¨¾¯Â¼Ïñ */
+	                epRecModuleRecStaSet(EP_REC_TYPE, EP_REC_STATE_END, ucLaneId);
+
+                    strCurSnapInfo.cAsfSendFalg = 1;
+                    /* ÔÙ¿ªÆô±¾´Î±¨¾¯Â¼Ïñ */
+                    DSP_INFO("end last alarm rec,laneId:%d\n", ucLaneId);
+                    g_strEpJSendInfo.strEpJSendInfo = strCurSnapInfo;
+                    epRecModuleRecStaSet(EP_REC_TYPE, EP_REC_STATE_BEGIN, ucLaneId);
+	            }
+	            else
+	            {
+	                g_strEpJSendInfo.strEpJSendInfo = strCurSnapInfo;                
+
+	                /* Ö±½Ó¿ªÆô±¾´Î±¨¾¯Â¼Ïñ */
+	                epRecModuleRecStaSet(EP_REC_TYPE, EP_REC_STATE_BEGIN, ucLaneId);
+	                DSP_INFO("begin rec g_param laneId:%d\n", ucLaneId);
+	            }
+	        }
+		}
+	}
+	return 1;
+}
+
+void XCS500RJpegCallBack(data_param_t *param, int iStrLen)
+{
+    /* FTPÄ£¿éÒªÇóÖ»ÒªÆäÖÐÄ³Ò»²½Ã»ÓÐ»º´æÁË»òDSP¸ø´íÁË¶¼²»ÄÜÉÏ´«Ò²²»ÄÜÐ´»º´æ */
+    int s_uiFileSeq = 0;
+    int s_uiFileSum = 0;
+    int iRecSta =0;
+    unsigned int uiJpegLen =0;
+    unsigned char *pucJpegData = NULL;
+    unsigned char *pucFile = NULL;
+    JPEG_HEADER *pJpegHeader = NULL;
+    unsigned char ucSnapType = 0;
+    unsigned char ucLaneId =0;
+    JpegSendInfo strCurSnapInfo;
+    VEHICLE_DETECT_HEADER *pVehicleHead =NULL;
+
+    if ( (NULL == param->buf) || (0 == param->buf_len) || (param == NULL) )
+    {
+        DSP_ERROR("%s %d param invalid .\n",__FUNCTION__,__LINE__);
+        return ;
+    }
+    else
+    {
+        DSP_INFO("%s %d get a jpeg buf all len= %dKB.\n",__FUNCTION__,__LINE__,param->buf_len/1024);
+    }
+
+    memset(&strCurSnapInfo, 0, sizeof(strCurSnapInfo));
+
+    pucJpegData = param->buf;
+    pJpegHeader = (JPEG_HEADER* )pucJpegData;
+    pVehicleHead = (VEHICLE_DETECT_HEADER* )(pucJpegData + sizeof(JPEG_HEADER) );
+    uiJpegLen = pJpegHeader->imgLen;
+
+    s_uiFileSeq = pJpegHeader->snapID;
+    s_uiFileSum = pJpegHeader->snapNum;
+    ucSnapType  = pJpegHeader->snapType;
+
+    ucLaneId = pVehicleHead->lane;
+
+    strCurSnapInfo.auiPicLen[s_uiFileSeq] = uiJpegLen ;
+    ftpEPLaneNameSet(&strCurSnapInfo, ucLaneId);
+
+    pucFile = pucJpegData + iStrLen;
+
+    /*Èç¹ûftp Ê¹ÄÜÁË ÔòÍ¨¹ýftp·¢ËÍÍ¼Æ¬*/
+    if (g_cFtpInitSta)
+    {
+        strCurSnapInfo.pcPicBuf = (char *)pucFile;
+        strCurSnapInfo.auiPicLen[s_uiFileSeq] = uiJpegLen;
+        strCurSnapInfo.iPicNum = s_uiFileSum;
+        strCurSnapInfo.iGroupId = pJpegHeader->snapGroupID;
+        strCurSnapInfo.iCurrPicIndex = s_uiFileSeq;
+
+        strCurSnapInfo.uiSnapTimeSecs     = pJpegHeader->seconds;
+        strCurSnapInfo.uiSnapTimeMsSecs   = pJpegHeader->uiMsSeconds/1000;
+        
+        XCS500RFillJpegInfo(&strCurSnapInfo, pVehicleHead, ucSnapType);
+
+        DSP_INFO("lane:%d ucSnapType is %d\n",ucLaneId, ucSnapType);
+
+        /* Èç¹ûÊÇ±¨¾¯Â¼ÏñÍ¨Öª£¬ÔòÖ±½Ó·µ»Ø£¬FTP²»×ö´¦Àí */
+        if( ( pJpegHeader->imgLen < MIN_JPEG_PIC_LEN ) ||( pJpegHeader->imgLen > MAX_JPEG_PIC_LEN ) )
+        {
+            DSP_INFO("lane:%d,red light alarm report,dir return\n", ucLaneId);
+            return;
+        }
+
+        bool bRet = false;
+        bRet = g_CEPFtp->FtpSendPicture(&strCurSnapInfo);	// tangzl 0725
+        if( !bRet )
+        {
+            DSP_INFO("%s %d lane_%d send pic file failed.fileType:%d,index:%d,picNumSum:%d,groupId:%d\n", __FUNCTION__,__LINE__,\
+                ucLaneId, strCurSnapInfo.cFileType, \
+                strCurSnapInfo.iCurrPicIndex,\
+                strCurSnapInfo.iPicNum,\
+                strCurSnapInfo.iGroupId);
+        }
+        else
+        {
+            DSP_INFO("%s %d lane_%d send pic file ok.fileType:%d,index:%d,picNumSum:%d,groupId:%d\n", __FUNCTION__,__LINE__,\
+                ucLaneId, strCurSnapInfo.cFileType, \
+                strCurSnapInfo.iCurrPicIndex,\
+                strCurSnapInfo.iPicNum,\
+                strCurSnapInfo.iGroupId);
+        }
+    }
+    
+    return;
+}
+#endif
+
+static int pPFillJpegInfo(JpegSendInfo *pStrJSendInfo,VEHICLE_DETECT_HEADER *pVehicleHead,unsigned char ucSnapType )
+{
+    #if defined(CYC200MK)||defined(CYC200K3)||defined(CYC200K2)||defined(CYC200KT)||defined(CYC500K)||defined(CYC500KD)||defined(CYC500KKW2C)
+    int ret =0;
+    PASSPORT_OVERALL_CONF_INFO strPpOverallInfoGet;
+    PORT_VEHICLE_CONF_INFO strChannelInfoGet;
+    memset(&strPpOverallInfoGet, 0, sizeof(strPpOverallInfoGet));
+    memset(&strChannelInfoGet, 0, sizeof(strChannelInfoGet));
+    ret = SysConfGet(e_PASSPORT_OVERALL_CONF, &strPpOverallInfoGet, pVehicleHead->lane);
+    if ( 0 != ret )
+    {
+        DSP_ERROR("%s %d get pp overall conf failed!\n",__FUNCTION__,__LINE__);
+        return -1;
+    }
+    ret = SysConfGet(e_PASSPORT_VEHICLE_CONF, &strChannelInfoGet, pVehicleHead->lane);
+    if ( 0 != ret )
+    {
+        DSP_ERROR("%s %d get pp vehicle conf failed!\n",__FUNCTION__,__LINE__);
+        return -1;
+    }
+
+    strcpy(pStrJSendInfo->szDirectionId, strPpOverallInfoGet.szDirId);
+    strcpy(pStrJSendInfo->szPortId, strPpOverallInfoGet.szPassPortId);
+    strcpy(pStrJSendInfo->szLaneId, strChannelInfoGet.szLaneId);
+
+    memset(pStrJSendInfo->szPpDevCode, 0, sizeof(pStrJSendInfo->szPpDevCode));
+    strcat(pStrJSendInfo->szPpDevCode, strPpOverallInfoGet.szPpDevCode);
+    pStrJSendInfo->szPpDevCode[MAX_DEV_CODE_LEN -1] =0;
+    strcat(pStrJSendInfo->szPpDevCode, strPpOverallInfoGet.szExPpDevCode);
+    pStrJSendInfo->szPpDevCode[MAX_DEV_CODE_LEN+EXT_DEV_CODE_LEN -1] =0;
+    
+    pStrJSendInfo->iLaneIndex = pVehicleHead->lane;
+
+    DSP_INFO("%s %d snapType:%d,speed:%d,irreSpeed:%d.!\n",__FUNCTION__,__LINE__,\
+    ucSnapType, pVehicleHead->speed, strChannelInfoGet.usIrreSpeed);
+    
+    if( (pVehicleHead->speed > strChannelInfoGet.usIrreSpeed) \
+        && (( ucSnapType == SNAP_TYPE_SPEED )||( ucSnapType == SNAP_TYPE_RADAR ) ))
+    {
+        pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities =   1;
+    }
+    else
+    {
+        pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities =   0; 
+    }
+
+    if(( SNAP_TYPE_REVERSE == ucSnapType ) || ( SNAP_TYPE_TRUCK == ucSnapType )\
+    ||(SNAP_TYPE_DIR_REVERSE == ucSnapType ) )
+    {
+        pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities =   1;
+    }
+
+
+    if ( 1 == pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities )
+    {
+        if(pVehicleHead->speed > (pVehicleHead->maxspeed/2*3))
+        {
+            pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities_type = IRR_TYPE_OVER_HALF_SPEED;
+        }
+        else if (pVehicleHead->speed > (strChannelInfoGet.usIrreSpeed))
+        {
+            pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities_type = IRR_TYPE_OVER_SPEED;
+        }
+        
+        if (( SNAP_TYPE_REVERSE == ucSnapType)||(SNAP_TYPE_DIR_REVERSE == ucSnapType ) )
+        {
+            pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities_type = IRR_TYPE_REVERSE_DIR;
+        }
+        
+        if( SNAP_TYPE_TRUCK == ucSnapType)
+        {
+            pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities_type = IRR_TYPE_TRUCK_FORBID;
+        }
+    }
+    else
+    {
+        pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities_type = 0;
+    }
+
+    g_strCXProInfo.cLaneId = atoi(strChannelInfoGet.szLaneId);
+
+    pStrJSendInfo->usSnapGroupId = pVehicleHead->usSnapGroupId;
+
+	switch(g_PPLaneSwitchInfo[pVehicleHead->lane].cGroudCoilDecType)
+	{
+		case GROUD_DUBAL_COIL:
+			pStrJSendInfo->ucCoilDecType =  FTP_GROUD_DUBAL_COIL;
+			break;
+		case GROUD_SINGAL_COIL_NO_SPEED:
+		case GROUD_SINGAL_COIL_SPEED:
+			if( g_PPLaneSwitchInfo[pVehicleHead->lane].cSingalCoilPos == SINGAL_COIL_POS_FRONT)
+			{
+				pStrJSendInfo->ucCoilDecType =  FTP_GROUD_SINGAL_COIL_FRONT;
+			}
+			else
+			{
+				pStrJSendInfo->ucCoilDecType =  FTP_GROUD_SINGAL_COIL_BEHIND;
+			}
+			break;
+		default:
+			pStrJSendInfo->ucCoilDecType =  FTP_VIRTUAL_COIL_TYPE;
+			break;
+	}
+    
+    #elif defined(CYC500XKW4C)||defined(CYC500XAW)
+
+    int ret =0;
+    PASSPORT_OVERALL_CONF_INFO strPpOverallInfoGet;
+    memset(&strPpOverallInfoGet, 0, sizeof(strPpOverallInfoGet));
+    ret = SysConfGet(e_PASSPORT_OVERALL_CONF, &strPpOverallInfoGet, pVehicleHead->lane);
+    if ( 0 != ret )
+    {
+        DSP_ERROR("%s %d get pp overall conf failed!\n",__FUNCTION__,__LINE__);
+        return -1;
+    }
+
+    memset(pStrJSendInfo->szPpDevCode, 0, sizeof(pStrJSendInfo->szPpDevCode));
+    strcat(pStrJSendInfo->szPpDevCode, strPpOverallInfoGet.szPpDevCode);
+    pStrJSendInfo->szPpDevCode[MAX_DEV_CODE_LEN -1] =0;
+    strcat(pStrJSendInfo->szPpDevCode, strPpOverallInfoGet.szExPpDevCode);
+    pStrJSendInfo->szPpDevCode[MAX_DEV_CODE_LEN+EXT_DEV_CODE_LEN -1] =0;
+    
+    ELEC_POLICE_VEHICLE_CONF_INFO strEPChanConf;
+    ELEC_POLICE_OVERALL_CONF_INFO strEPGlobalConf;
+    memset(&strEPChanConf, 0, sizeof(strEPChanConf));
+    memset(&strEPGlobalConf, 0, sizeof(strEPGlobalConf));
+    
+    ret = SysConfGet(e_ELEC_POLICE_VEHICLE_CONF, &strEPChanConf, pVehicleHead->lane);
+    if ( 0 != ret )
+    {
+        DSP_ERROR("%s %d get ep vehicle conf failed!\n",__FUNCTION__,__LINE__);
+        return -1;
+    }
+
+    ret = SysConfGet(e_ELEC_POLICE_OVERALL_CONF, &strEPGlobalConf, pVehicleHead->lane);
+    if ( 0 != ret )
+    {
+        DSP_ERROR("%s %d get ep overall conf failed!\n",__FUNCTION__,__LINE__);
+        return -1;
+    }
+    
+    strcpy(pStrJSendInfo->szDirectionId, strEPGlobalConf.szDirId);
+    strcpy(pStrJSendInfo->szPortId, strEPGlobalConf.szRoadId);
+    strcpy(pStrJSendInfo->szLaneId, strEPChanConf.szLaneId);
+    
+    /* ×¢Òâ:ÐèÒªÌí¼ÓºÍ330Æ½Ì¨¶ÔÓ¦µÄ³µµÀºÅ±àÂë */
+    pStrJSendInfo->iLaneIndex = pVehicleHead->lane;
+
+    /* Ôö¼ÓÆïÏßÎ¥ÕÂ´¦Àí */
+    if(SNAP_TYPE_RIDE_LINES == ucSnapType)
+        pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities =   1;
+    else
+        pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities =   0; 
+
+
+    if ( 1 == pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities )
+    {
+        if(SNAP_TYPE_RIDE_LINES == ucSnapType)
+        {
+            pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities_type = IRR_TYPE_RIDE_LINES;
+        }
+    }
+    else
+    {
+        pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities_type = 0;
+    }
+
+    g_strCXProInfo.cLaneId = atoi(strEPChanConf.szLaneId);
+
+    #endif
+    DSP_INFO("%s %d 140 laneIndex:0x%x.\n",__FUNCTION__,__LINE__, pStrJSendInfo->iLaneIndex);
+    pStrJSendInfo->strParam.pos_info.m_left = pVehicleHead->rect.left;
+    pStrJSendInfo->strParam.pos_info.m_top = pVehicleHead->rect.top;
+    pStrJSendInfo->strParam.pos_info.m_bottom = pVehicleHead->rect.bottom;
+    pStrJSendInfo->strParam.pos_info.m_right = pVehicleHead->rect.right;
+
+    pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_speed = pVehicleHead->speed;
+    pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_speed_thresh = pVehicleHead->maxspeed;
+    
+    DSP_INFO("\n\n%s %d snapType:%d,m_irregularities:%d,type:%d,vehicleType:%d\n",__FUNCTION__,__LINE__, ucSnapType,\
+    pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities,\
+    pStrJSendInfo->strParam.SnapPicInfo.port_snap_info.m_irregularities_type,pVehicleHead->vehicleType);
+    pStrJSendInfo->strParam.pos_info.m_type = pVehicleHead->vehicleType;
+
+    pStrJSendInfo->strParam.pos_info.m_confidence = pVehicleHead->confidence;
+    pStrJSendInfo->cFileType = JPG_FILE_TYPE;/*this is modified by yzq 2010-9-20*/
+
+    DSP_INFO("\n\n%s %d.lane:%d, cGroudCoilDecType:%d!\n",__FUNCTION__,__LINE__,\
+    pVehicleHead->lane, g_PPLaneSwitchInfo[pVehicleHead->lane].cGroudCoilDecType);
+    
+    if( g_PPLaneSwitchInfo[pVehicleHead->lane].cGroudCoilDecType == CS_RADAR_SPEED )
+    {
+        pStrJSendInfo->ucSnapType = SNAP_TYPE_RADAR;
+    }
+    else
+    {
+        pStrJSendInfo->ucSnapType = ucSnapType;        
+    }
+
+    pStrJSendInfo->lpColor        = pVehicleHead->lpColor;
+    pStrJSendInfo->lpConfidenct   = pVehicleHead->lpConfidenct;
+    pStrJSendInfo->lpFCConfidenct = pVehicleHead->lpFCConfidenct;
+    pStrJSendInfo->lpRect.start_x = pVehicleHead->lpRect.left;
+    pStrJSendInfo->lpRect.start_y = pVehicleHead->lpRect.top;
+    pStrJSendInfo->lpRect.width   = pVehicleHead->lpRect.right - pVehicleHead->lpRect.left;
+    pStrJSendInfo->lpRect.height  = pVehicleHead->lpRect.bottom - pVehicleHead->lpRect.top;
+    pStrJSendInfo->LPREnable      = pVehicleHead->LPREnable;
+    pStrJSendInfo->lpType         = pVehicleHead->lpType;
+    strcpy(pStrJSendInfo->lpStr, pVehicleHead->lpStr);
+
+    for(int i=0; i< 2; i++)
+    {
+        DSP_INFO("%s %d pic%d sec:%d,msec:%d.\n",__FUNCTION__,__LINE__, i, \
+        pVehicleHead->strSnapPicTime[i].uiSec, pVehicleHead->strSnapPicTime[i].uiMSec);
+    }
+    memcpy( pStrJSendInfo->strSanpPicTime, pVehicleHead->strSnapPicTime, sizeof( pVehicleHead->strSnapPicTime ));
+    //ÎÂ¶È 
+    g_strCXProInfo.cDevTemprature = g_cTemperature;
+    pStrJSendInfo->strFtpCXProInfo = g_strCXProInfo;
+
+#if USE_FACE_IDENT
+    pStrJSendInfo->ucFaceIdenEn = pVehicleHead->ucFaceIdenEn;
+    pStrJSendInfo->ucFaceOvenlayEn = pVehicleHead->ucFaceOvenlayEn;
+    
+    if( pVehicleHead->ucFaceSum > MAX_FACE_NUM)
+    {
+    	pVehicleHead->ucFaceSum = MAX_FACE_NUM;
+    }
+    pStrJSendInfo->ucFaceSum = pVehicleHead->ucFaceSum;
+    
+    pStrJSendInfo->strFaceSearchArea.start_x = pVehicleHead->strFaceSearchArea.left;
+    pStrJSendInfo->strFaceSearchArea.start_y = pVehicleHead->strFaceSearchArea.top;
+    pStrJSendInfo->strFaceSearchArea.width   = pVehicleHead->strFaceSearchArea.right - pVehicleHead->strFaceSearchArea.left;
+    pStrJSendInfo->strFaceSearchArea.height  = pVehicleHead->strFaceSearchArea.bottom - pVehicleHead->strFaceSearchArea.top;
+
+	for(int i=0; i< pVehicleHead->ucFaceSum; i++)
+    {
+	    pStrJSendInfo->aStrFaceIden[i].start_x = pVehicleHead->aStrFaceIden[i].left;
+	    pStrJSendInfo->aStrFaceIden[i].start_y = pVehicleHead->aStrFaceIden[i].top;
+	    pStrJSendInfo->aStrFaceIden[i].width   = pVehicleHead->aStrFaceIden[i].right - pVehicleHead->aStrFaceIden[i].left;
+	    pStrJSendInfo->aStrFaceIden[i].height  = pVehicleHead->aStrFaceIden[i].bottom - pVehicleHead->aStrFaceIden[i].top;
+    }
+#if 1
+    pStrJSendInfo->ucSaveSmallPicEn = pVehicleHead->ucSaveSmallPicEn;
+    if( pVehicleHead->ucSaveSmallPicEn > 0 )
+    {
+    	pStrJSendInfo->auiBigPicSize[pStrJSendInfo->iCurrPicIndex] = pStrJSendInfo->auiPicLen[pStrJSendInfo->iCurrPicIndex];
+    	for(int i=0; i< pVehicleHead->ucFaceSum; i++)
+	    {
+		    pStrJSendInfo->aStrFacePicInfo[i].uiPicAddrOffset = pVehicleHead->aStrFacePicInfo[i].uiPicAddrOffset;
+			pStrJSendInfo->aStrFacePicInfo[i].uiPicLen = pVehicleHead->aStrFacePicInfo[i].uiPicLen;
+			pStrJSendInfo->auiPicLen[pStrJSendInfo->iCurrPicIndex] += pStrJSendInfo->aStrFacePicInfo[i].uiPicLen;
+	    }
+    }
+    else
+    {
+    	pStrJSendInfo->auiBigPicSize[pStrJSendInfo->iCurrPicIndex] = pStrJSendInfo->auiPicLen[pStrJSendInfo->iCurrPicIndex];
+    }
+#endif
+
+#endif
+
+    return 0;
+}
+
+
+void pPJpegCallBack(data_param_t *param, int iStrLen)
+{
+    /* FTPÄ£¿éÒªÇóÖ»ÒªÆäÖÐÄ³Ò»²½Ã»ÓÐ»º´æÁË»òDSP¸ø´íÁË¶¼²»ÄÜÉÏ´«Ò²²»ÄÜÐ´»º´æ */
+
+    unsigned int s_uiFileSeq = 0;
+    unsigned int s_uiFileSum = 0;
+    unsigned int uiJpegLen =0;
+    unsigned char *pucJpegData = NULL;
+    unsigned char *pucFile = NULL;
+    JPEG_HEADER *pJpegHeader = NULL;
+    VEHICLE_DETECT_HEADER *pVehicleHead =NULL;
+    unsigned char ucSnapType = 0;
+    static JpegSendInfo  s_strJSendInfo = {0};
+	
+    if ( (NULL == param->buf) || (0 == param->buf_len) )
+    {
+        DSP_ERROR("%s %d param invalid .\n",__FUNCTION__,__LINE__);
+        return ;
+    }
+    else
+    {
+        DSP_INFO("%s %d get a jpeg buf all len= %dB.\n",__FUNCTION__,__LINE__,param->buf_len);
+    }
+    
+    pucJpegData = param->buf;
+    pJpegHeader = (JPEG_HEADER* )pucJpegData;
+    pVehicleHead = (VEHICLE_DETECT_HEADER* )(pucJpegData + sizeof(JPEG_HEADER) );
+
+    s_uiFileSeq = pJpegHeader->snapID;
+    s_uiFileSum = pJpegHeader->snapNum;
+    ucSnapType  = pJpegHeader->snapType;
+
+    DSP_INFO("%s %d snapType= 0x%x,fileSum:%d.\n",__FUNCTION__,__LINE__,ucSnapType, pJpegHeader->snapNum);
+
+    uiJpegLen = pJpegHeader->imgLen;
+    s_strJSendInfo.auiPicLen[s_uiFileSeq] = uiJpegLen;
+
+    ftpPPLaneNameSet(&s_strJSendInfo, pVehicleHead->lane);
+
+    pucFile = pucJpegData + iStrLen;
+    if (g_cFtpInitSta)
+    {
+        s_strJSendInfo.pcPicBuf                   = (char *)pucFile;
+        s_strJSendInfo.auiPicLen[s_uiFileSeq]     = uiJpegLen;
+        s_strJSendInfo.iPicNum                    = s_uiFileSum;
+        s_strJSendInfo.iGroupId                   = pJpegHeader->snapGroupID;
+        s_strJSendInfo.iCurrPicIndex              = s_uiFileSeq;
+
+        if ( 0 == s_uiFileSeq )
+        {
+            s_strJSendInfo.uiSnapTimeMsSecs           = pJpegHeader->uiMsSeconds/1000;
+            s_strJSendInfo.uiSnapTimeSecs             = pJpegHeader->seconds;
+        }
+
+        pPFillJpegInfo(&s_strJSendInfo,pVehicleHead,ucSnapType);
+
+        bool bRet = false;
+		#if 0
+		int i =0;
+		for(i=0; i< s_strJSendInfo.iPicNum; i++)
+		{
+			DSP_ERROR("auiPicLen_%d is %d,bigPicLen_%d:%d.\n",i, s_strJSendInfo.auiPicLen[i], i, s_strJSendInfo.auiBigPicSize[i]);
+		}
+		#endif
+        bRet = g_CPPFtp->FtpSendPicture(&s_strJSendInfo);	// tangzl 0725
+
+        if( !bRet )
+        {
+            DSP_INFO("%s %d FtpSendPicture failed.\n",__FUNCTION__,__LINE__);
+        }
+        else
+        {
+            DSP_INFO("%s %d FtpSendPicture ok.\n",__FUNCTION__,__LINE__);
+        }
+    }
+    return;
+}
+#if 0
+void TimerRecFileSend(char *pcFileName)
+{
+    int ret =0;
+    char *ppBuf = NULL;
+    JpegSendInfo  strJSendInfo = {0};
+
+#ifdef MODULE_ALARMREC
+    if(g_cAlarmRecSta)
+    {
+        ftpPPLaneNameSet(&strJSendInfo, 0);
+        ret = xcs500xMemAsfFileGet(TIME_REC_TYPE, (void **)&ppBuf);
+        if(0 < ret)
+        {
+            struct timeval tv;
+            struct timezone tz;
+            gettimeofday(&tv,&tz);
+
+            strJSendInfo.uiSnapTimeMsSecs = tv.tv_usec/1000;
+            strJSendInfo.uiSnapTimeSecs   = tv.tv_sec  + 8*3600;
+            //DSP_ERROR("%s %d FtpSendPicture asf file seconds:%ld.\n",__FUNCTION__,__LINE__, strJSendInfo.uiSnapTimeSecs);
+            strJSendInfo.cFileType = ASF_FILE_TYPE;
+            strJSendInfo.pcPicBuf = ppBuf;
+            strJSendInfo.iCurrPicIndex = 0;
+            strJSendInfo.auiPicLen[0] = ret;
+            strJSendInfo.iPicNum = 1;
+            if( NULL!= g_CPPFtp )
+            {
+                ret = g_CPPFtp->FtpSendPicture(&strJSendInfo);	// tangzl 0725
+                if( !ret )
+                {
+                    DSP_ERROR("%s %d FtpSendPicture asf failed.\n",__FUNCTION__,__LINE__);
+                }
+                else
+                {
+                    DSP_INFO("%s %d FtpSendPicture asf ok.len:%d\n",__FUNCTION__,__LINE__, ret);
+                }
+            }
+            else
+            {
+                DSP_INFO("%s %d g_CPPFtp is null.\n",__FUNCTION__,__LINE__);
+            }
+            /* É¾³ýasfÎÄ¼þ */
+            epRecModuleFileExitStaSet(TIME_REC_TYPE, 0);
+       }
+       else
+       {
+            DSP_INFO("%s %d xcs500xMemAsfFileGet ger file failed,ret:%d\n",__FUNCTION__,__LINE__, ret);
+       }
+   }
+#endif /* MODULE_ALARMREC */
+}
+
+#endif
+
+int   JpgEncryption(unsigned char *pSrc, int length, unsigned char *pL2Tmp, int L2length)
+{
+    int i,j;
+    int *pInA, *pInB, *pTmp;
+    int sum=0;
+    int addlen;
+    unsigned char *pTemp = NULL;
+
+    pTemp = pSrc;
+    pSrc[length]=0; 
+    pSrc[length+1] = 0;
+    pSrc[length+2] = 0;
+    pSrc[length+3] = 0;
+
+    L2length = L2length > (120*1024) ? 120*1024 : L2length;
+    L2length = L2length>>1;
+    addlen = L2length>>2;
+    pL2Tmp +=  (16- ((unsigned int)pL2Tmp)&0xF);
+    pInA = (int *)pL2Tmp;
+    pInB = (int *)(pL2Tmp + L2length);
+
+        memcpy(pInB, pTemp, L2length);
+    for (i=0; i<length/L2length; i++)
+    {
+       pTmp = pInA;
+       pInA = pInB;
+       pInB = pTmp;
+      
+       pTemp += L2length;
+       memcpy(pInB, pTemp, L2length);
+       for (j=0; j<addlen; j++)
+       {
+            sum += pInA[j];
+       }
+    }
+    for (j= 0; j<((length+3)>>2)-i*addlen; j++)
+    {
+        sum += pInB[j];
+    }
+    pSrc[length] = 'k';
+    pSrc[length+1]= 'j';
+    *((int *)(pSrc+length+4))= sum;
+    return sum;
+}
+
+int JpgDefModify(unsigned char *pSrc, int length)
+{
+    int i =0;
+    int iSumTimes =0;
+    unsigned int uiSum =0;
+    unsigned char *pTmp;
+    iSumTimes = length/1024;
+    for(i =0; i< iSumTimes; i++)
+    {
+        pTmp = pSrc;
+        pTmp += iSumTimes*1024;
+        uiSum += *(unsigned int *)pTmp;
+    }
+    pSrc[length] = 'k';
+    pSrc[length+1]= 'j';
+    pSrc[length+2]= 0;
+    pSrc[length+3]= 0;
+    *((unsigned int *)(pSrc+length+4))= uiSum;
+    return uiSum;
+}
+
+static void dspJpegProcess(data_param_t *param)
+{
+DSP_ERROR("11111111111111dspJpegProcess\n");
+ int iEndSum =0;
+    int i =0;
+    unsigned int uiJpegLen =0;
+    unsigned char *pucJpegData = NULL;
+    unsigned char *pucFile = NULL;
+    JPEG_HEADER *pJpegHeader = NULL;
+    VEHICLE_DETECT_HEADER *pVehicleHead =NULL;
+    unsigned char ucSnapType = 0;
+    unsigned int uiSmallPicLen =0;
+
+	/* »Øµ÷Êý¾Ý½á¹¹Ìå³¤¶È£¬ÓÃÓÚ¶¨Î»jepgÆðÊ¼ÄÚ´æµØÖ· */
+	int iDataStrLen =0;
+
+    DSP_INFO("enter dspJpegCall!\n");
+   
+
+    sem_wait(&sem_dsp_data);
+    DSP_INFO("enter1 dspJpegCall!\n");
+DSP_ERROR("2222222222dspJpegProcess\n");
+
+    /* Í¨¹ýTCP×ßXCSÐ­Òé°ÑÍ¼Æ¬·¢ËÍ³öÈ¥ */
+    if ( 1== g_bTcpDataOk)
+    {
+		printf("### sendPicToServer\n");
+              SendPicToServer((char*)param->buf, param->buf_len);
+       
+        
+    }
+DSP_ERROR("333333333dspJpegProcess\n");
+    /*Èç¹ûftp Ê¹ÄÜÁË ÔòÍ¨¹ýftp·¢ËÍÍ¼Æ¬*/
+    if (g_cFtpInitSta)
+    {
+        switch(device_code)
+        {
+            #if defined(CYC200MK)||defined(CYC200K3)||defined(CYC200K2)||defined(CYC200KT)||defined(CYC500K)||defined(CYC500KD)||defined(CYC500KKW2C)
+            case CYC200K3_DEV_CODE:
+            case CYC500K_DEV_CODE:
+            case CYC500KD_DEV_CODE:
+            case CYC500KKW2C_DEV_CODE:
+            case CYC200KT_DEV_CODE:
+            case CYC200K2_DEV_CODE:
+            case CYC200MK_DEV_CODE:
+                pPJpegCallBack(param, iDataStrLen);
+            break;
+            #endif
+
+
+			#if defined(CYC500XKW4C)||defined(CYC500XAW)
+            case CYC500XKW4C_DEV_CODE:
+            case CYC500XAW_DEV_CODE:
+                switch(ucSnapType)
+                {
+                    case SNAP_TYPE_SPEED:
+                    case SNAP_TYPE_REVERSE:
+                    case SNAP_TYPE_CLIP:
+                    case SNAP_TYPE_RIDE_LINES:
+                    case SNAP_TYPE_DIR_REVERSE:
+					case SNAP_TYPE_CX_NULL_SNAP:
+                        if(( pJpegHeader->imgLen > MIN_JPEG_PIC_LEN ) &&( pJpegHeader->imgLen < MAX_JPEG_PIC_LEN ))
+                        {
+                            DSP_INFO("go into pp ftp send!\n");
+                            pPJpegCallBack(param, iDataStrLen);
+                            DSP_INFO("go out pp ftp send!\n");
+                        }
+                    break;
+                    case SNAP_TYPE_3_PLUS_1:
+                    case SNAP_TYPE_6_PLUS_1:
+                    case SNAP_TYPE_3_SEPARATE:
+                    case SNAP_TYPE_EP_REVERSE:
+                    case SNAP_TYPE_3_PLUS_1_LEFT:
+                    case SNAP_TYPE_4_SEPARATE:
+                        DSP_INFO("go into ep ftp send!\n");
+                        XCS500RJpegCallBack(param, iDataStrLen);
+                        DSP_INFO("go out ep ftp send!\n");
+                    break;
+                    default:
+                    break;
+                }
+            break;
+            #endif
+            default:
+                DSP_ERROR("dev code is error,not send jpeg!\n");
+            break;
+        }
+    }
+    sem_post(&sem_dsp_data);
+    DSP_INFO("leave dspJpegCall!\n");
+    return;
+
+#if 0
+    int iEndSum =0;
+    int i =0;
+    unsigned int uiJpegLen =0;
+    unsigned char *pucJpegData = NULL;
+    unsigned char *pucFile = NULL;
+    JPEG_HEADER *pJpegHeader = NULL;
+    VEHICLE_DETECT_HEADER *pVehicleHead =NULL;
+    unsigned char ucSnapType = 0;
+    unsigned int uiSmallPicLen =0;
+
+	/* »Øµ÷Êý¾Ý½á¹¹Ìå³¤¶È£¬ÓÃÓÚ¶¨Î»jepgÆðÊ¼ÄÚ´æµØÖ· */
+	int iDataStrLen =0;
+
+    DSP_INFO("enter dspJpegCall!\n");
+    if ( (NULL == param->buf) || (0 >= param->buf_len) || ( param == NULL ) )
+    {
+        DSP_ERROR("%s %d param invalid .\n",__FUNCTION__,__LINE__);
+        return;
+    }
+
+    sem_wait(&sem_dsp_data);
+    DSP_INFO("enter1 dspJpegCall!\n");
+    pucJpegData = param->buf;
+    pJpegHeader = (JPEG_HEADER* )pucJpegData;
+    pVehicleHead = (VEHICLE_DETECT_HEADER* )(pucJpegData + sizeof(JPEG_HEADER) );
+
+    {
+        DSP_INFO("jpg get a jpeg buf len:%ld,img len:%ld.ucSaveSmallPicEn:%d.param add:0x%x,buf add:0x%x\n", param->buf_len, pJpegHeader->imgLen, pVehicleHead->ucSaveSmallPicEn,param, pucJpegData);
+    }
+
+	if( pVehicleHead->ucSaveSmallPicEn > 0)
+	{
+		//DSP_ERROR("---small pic sum:%d.\n", pVehicleHead->ucFaceSum);
+		for(i=0; i< pVehicleHead->ucFaceSum; i++)
+		{
+			uiSmallPicLen += pVehicleHead->aStrFacePicInfo[i].uiPicLen;
+			//DSP_ERROR("---small pic_%d len:%d.\n", i, pVehicleHead->aStrFacePicInfo[i].uiPicLen);
+			//DSP_ERROR("---small pic_%d offset:0x%x.\n", i, pVehicleHead->aStrFacePicInfo[i].uiPicAddrOffset);
+		}
+		iDataStrLen = param->buf_len - pJpegHeader->imgLen - uiSmallPicLen;
+	}
+	else
+	{
+		iDataStrLen = param->buf_len - pJpegHeader->imgLen;
+	}
+	
+	if( iDataStrLen	== sizeof(JPEG_HEADER) + sizeof(VEHICLE_DETECT_HEADER) )
+	{
+		DSP_INFO("strLen:%d is ok.\n", iDataStrLen);
+	}
+	else
+	{
+		DSP_ERROR("strLen:%d is failed.act str len:%d.\n", iDataStrLen, sizeof(JPEG_HEADER) + sizeof(VEHICLE_DETECT_HEADER));
+		syslog(LOG_ERR|LOG_USER, "error:jpgCallback strHeadLen:%d is failed. act strHeadlen:%d.\n", iDataStrLen, sizeof(JPEG_HEADER) + sizeof(VEHICLE_DETECT_HEADER));	
+	}
+		
+
+    if((pJpegHeader->imgLen > MAX_JPEG_PIC_LEN) || (pJpegHeader->snapNum > MAX_PIC_NUM))
+    {
+        DSP_ERROR("%s %d imgLen:%d is too big. pic num:%d. return.\n",__FUNCTION__,__LINE__, pJpegHeader->imgLen, pJpegHeader->snapID);
+        syslog(LOG_ERR|LOG_USER, "%s %d imgLen:%d or pic num:%d is too big.return.\n",__FUNCTION__,__LINE__, pJpegHeader->imgLen, pJpegHeader->snapID);
+        sem_post(&sem_dsp_data);
+        return;
+    }
+    
+    uiJpegLen = ( pJpegHeader->imgLen + 3 )/4*4;
+
+    ucSnapType  = pJpegHeader->snapType;
+    
+    pucFile = pucJpegData + iDataStrLen;
+    
+#if 0
+
+    if(( *(pucFile+pJpegHeader->imgLen-1) != 0xd9 ) || ( *(pucFile+pJpegHeader->imgLen-2 ) != 0xff))
+    {
+        syslog(LOG_ERR|LOG_USER, "dsp report error jpg:no 0xffd9!\n");
+    }
+
+
+    /* add by its 2010-6-25 for ²âÊÔDSPÉÏ´«µÄÍ¼Æ¬¼ìÑéºÍÊÇ·ñÕýÈ· */
+    
+    iBeginSum = *(int *)(pucFile + uiJpegLen- 4);
+    memset(lTmpL2Buf, 0, TMP_L2_LEN);
+    iEndSum = JpgEncryption(pucFile, uiJpegLen-8, lTmpL2Buf, TMP_L2_LEN);
+    if(iBeginSum != iEndSum)
+    {
+        struct tm tmPlanStart;
+        char szDefault[256];
+        gmtime_r((time_t *)&(pJpegHeader->seconds), &tmPlanStart);
+        sprintf(szDefault,"%04d-%02d-%02d %02d:%02d:%02d",\
+        tmPlanStart.tm_year+1900,tmPlanStart.tm_mon+1,tmPlanStart.tm_mday,\
+        tmPlanStart.tm_hour,tmPlanStart.tm_min,tmPlanStart.tm_sec);
+        DSP_INFO("%s %d dsp sum is error,len is 0x%x.\n",__FUNCTION__,__LINE__,pJpegHeader->imgLen);
+        syslog(LOG_ERR|LOG_USER, "dsp pic sum error,date:%s,msec:%d\n", szDefault,pJpegHeader->uiMsSeconds);
+    }
+    else
+    {
+        memset(lTmpL2Buf, 0, TMP_L2_LEN);
+        iEndSum = JpgEncryption(pucFile, uiJpegLen, lTmpL2Buf, TMP_L2_LEN);
+        uiJpegLen += 8;
+        pJpegHeader->imgLen = uiJpegLen;
+        DSP_INFO("%s %d dsp sum is ok,len is 0x%x.\n",__FUNCTION__,__LINE__,pJpegHeader->imgLen);
+        
+    }
+    
+    /* end by its 2010-6-25 for ²âÊÔDSPÉÏ´«µÄÍ¼Æ¬¼ìÑéºÍÊÇ·ñÕýÈ· */
+#else
+
+	/* ½øÐÐ·À´Û¸Ä¼ÓÃÜ´¦Àí */
+	if( pVehicleHead->ucSaveSmallPicEn > 0)
+	{
+		uiJpegLen -= SMALL_PIC_RESV_ROOM;
+	    iEndSum = JpgDefModify(pucFile, uiJpegLen);
+	}
+	else
+	{
+		iEndSum = JpgDefModify(pucFile, uiJpegLen);
+	    uiJpegLen += PIC_WATERMARK_PWD_LEN;
+	    pJpegHeader->imgLen = uiJpegLen;
+	}
+#endif
+
+    /* Í¨¹ýTCP×ßXCSÐ­Òé°ÑÍ¼Æ¬·¢ËÍ³öÈ¥ */
+    if ( 1== g_bTcpDataOk)
+    {
+		#if defined(CYC500XKW4C)||defined(CYC500XAW)
+        if(( pJpegHeader->imgLen > MIN_JPEG_PIC_LEN ) &&( pJpegHeader->imgLen < MAX_JPEG_PIC_LEN ))
+        {
+            DSP_INFO("pic len :%d,snap type:%d\n", pJpegHeader->imgLen, pJpegHeader->snapType);
+            SendPicToServer((char*)pucFile, pJpegHeader->imgLen);
+        }
+        
+        #else
+        	if( pVehicleHead->ucSaveSmallPicEn > 0)
+        	{
+        		SNAP_INFORM strSnapInform;
+        		unsigned int aiAllPicLen[6]={0}; 
+
+				aiAllPicLen[0] = pJpegHeader->imgLen;
+				
+				for(i=0; i< pVehicleHead->ucFaceSum; i++)
+				{
+					aiAllPicLen[i+1] = pVehicleHead->aStrFacePicInfo[i].uiPicLen;
+				}
+        		
+			    strSnapInform.ucPicNum  	= pVehicleHead->ucFaceSum + 1;
+			    strSnapInform.auiPicLen 	= aiAllPicLen;
+			    strSnapInform.pszPicData   	= (char *)pucFile;
+
+				SendGroupPicToServer(&strSnapInform);
+        	}
+        	else
+        	{
+            	SendPicToServer((char*)pucFile, pJpegHeader->imgLen);
+			}
+            
+
+        #endif
+    }
+
+    /*Èç¹ûftp Ê¹ÄÜÁË ÔòÍ¨¹ýftp·¢ËÍÍ¼Æ¬*/
+    if (g_cFtpInitSta)
+    {
+        switch(device_code)
+        {
+            #if defined(CYC200MK)||defined(CYC200K3)||defined(CYC200K2)||defined(CYC200KT)||defined(CYC500K)||defined(CYC500KD)||defined(CYC500KKW2C)
+            case CYC200K3_DEV_CODE:
+            case CYC500K_DEV_CODE:
+            case CYC500KD_DEV_CODE:
+            case CYC500KKW2C_DEV_CODE:
+            case CYC200KT_DEV_CODE:
+            case CYC200K2_DEV_CODE:
+            case CYC200MK_DEV_CODE:
+                pPJpegCallBack(param, iDataStrLen);
+            break;
+            #endif
+
+
+			#if defined(CYC500XKW4C)||defined(CYC500XAW)
+            case CYC500XKW4C_DEV_CODE:
+            case CYC500XAW_DEV_CODE:
+                switch(ucSnapType)
+                {
+                    case SNAP_TYPE_SPEED:
+                    case SNAP_TYPE_REVERSE:
+                    case SNAP_TYPE_CLIP:
+                    case SNAP_TYPE_RIDE_LINES:
+                    case SNAP_TYPE_DIR_REVERSE:
+					case SNAP_TYPE_CX_NULL_SNAP:
+                        if(( pJpegHeader->imgLen > MIN_JPEG_PIC_LEN ) &&( pJpegHeader->imgLen < MAX_JPEG_PIC_LEN ))
+                        {
+                            DSP_INFO("go into pp ftp send!\n");
+                            pPJpegCallBack(param, iDataStrLen);
+                            DSP_INFO("go out pp ftp send!\n");
+                        }
+                    break;
+                    case SNAP_TYPE_3_PLUS_1:
+                    case SNAP_TYPE_6_PLUS_1:
+                    case SNAP_TYPE_3_SEPARATE:
+                    case SNAP_TYPE_EP_REVERSE:
+                    case SNAP_TYPE_3_PLUS_1_LEFT:
+                    case SNAP_TYPE_4_SEPARATE:
+                        DSP_INFO("go into ep ftp send!\n");
+                        XCS500RJpegCallBack(param, iDataStrLen);
+                        DSP_INFO("go out ep ftp send!\n");
+                    break;
+                    default:
+                    break;
+                }
+            break;
+            #endif
+            default:
+                DSP_ERROR("dev code is error,not send jpeg!\n");
+            break;
+        }
+    }
+    sem_post(&sem_dsp_data);
+    DSP_INFO("leave dspJpegCall!\n");
+    return;
+
+#endif
+}
+
+void RcvJpgCallBack(char* pBuffer, unsigned int dwBufSize, unsigned int dwUser)
+{DSP_ERROR("RcvJpgCallBack xcs  xcs  xcs  xcs xc\n");
+	#if 1 //test by fj
+	int i =0;
+	int iPicNum =0;
+	data_param_t strDataParm;
+	
+		strDataParm.chan_id =0;
+		strDataParm.data_type =0;
+		strDataParm.buf     = (unsigned char *)pBuffer;
+		strDataParm.buf_len = dwBufSize;
+		DSP_ERROR("RcvJpgCallBack xcs  xcs  xcs  xcs xc\n");
+		DSP_INFO("####RcvJpgCallBack xcs  xcs  xcs  xcs xcs xcs *P=%x size =%d##########\n",pBuffer,dwBufSize);
+		DSP_ERROR("RcvJpgCallBack xcs  xcs  xcs  xcs xcs xcs\n *P=%x size =%d#",pBuffer,dwBufSize);
+		dspJpegProcess(&strDataParm);
+
+	
+	#endif
+
+#if 0
+	int i =0;
+	int iPicNum =0;
+	data_param_t strDataParm;
+	char *pTmp = pBuffer+4;
+
+	if((pBuffer == NULL)||(dwBufSize < 4))
+	{
+		DSP_ERROR("RcvJpgCallBack in param is error,return!\n");
+		return ;
+	}
+
+	iPicNum = *(int *)pBuffer;
+	if( (4+iPicNum*8) != dwBufSize )
+	{
+		DSP_ERROR("RcvJpgCallBack in param dwBufSize is error!\n");
+	}
+	
+	for(i=0; i< iPicNum; i++)
+	{
+		strDataParm.chan_id =0;
+		strDataParm.data_type =0;
+		strDataParm.buf     = (unsigned char *)(*(unsigned int *)(pTmp+(i*2)*4));
+	 //pnal_num = 0x123456;
+__macroresult = defined(CYC200XZD)||defined(CYC500XZD) stop
+__macroresult = defined(CYC800JX)||defined(CYC800XKW4C) stop
+__macroresult = defined(CYC500XKW4C)||defined(CYC500XAW) stop
+__macroresult = defined(CYC200MK)||defined(CYC200K3)||defined(CYC200K2)||defined(CYC200KT) stop
+__macroresult = defined(CYC500K)||defined(CYC500KD)||defined(CYC500KKW2C) stop
+__macroresult = 1 stop
+__macroresult = 0
+	 stop
+__macroresult = 1
+i stop
+__macroresult = 0 
+# stop
+__macroresult = 0  stop
+__macroresult = 0 stop
+__macroresult = 0 stop
+__macroresult = defined(CYC500XKW4C)||defined(CYC500XAW) stop
+__macroresult = 1 stop
+__macroresult = 
+defined(CYC200MK)||defined(CYC200K3)||defined(CYC200K2)||defined(CYC200KT)||defined(CYC500K)||defined(CYC500KD)||defined(CYC500KKW2C)
+ stop
+__macroresult = defined(CYC500XKW4C)||defined(CYC500XAW) stop
+__macroresult = defined(CYC500XKW4C)||defined(CYC500XAW) stop
+__macroresult = 
+defined(CYC200MK)||defined(CYC200K3)||defined(CYC200K2)||defined(CYC200KT)||defined(CYC500K)||defined(CYC500KD)||defined(CYC500KKW2C)
+ stop
+__macroresult = defined(CYC500XKW4C)||defined(CYC500XAW) stop
+__macroresult = USE_FACE_IDENT stop
+__macroresult = 1 stop
+__macroresult = 0 stop
+__macroresult = 0 stop
+__macroresult = 
+defined(CYC200MK)||defined(CYC200K3)||defined(CYC200K2)||defined(CYC200KT)||defined(CYC500K)||defined(CYC500KD)||defined(CYC500KKW2C)
+ stop
+__macroresult = defined(CYC500XKW4C)||defined(CYC500XAW) stop
+__macroresult = 0 stop
+__macroresult = 0 stop
+__macroresult = defined(CYC500XKW4C)||defined(CYC500XAW) stop
+__macroresult = 
+defined(CYC200MK)||defined(CYC200K3)||defined(CYC200K2)||defined(CYC200KT)||defined(CYC500K)||defined(CYC500KD)||defined(CYC500KKW2C)
+ stop
+__macroresult = defined(CYC500XKW4C)||defined(CYC500XAW) stop
+__macroresult = 1  stop
+__macroresult = 0 stop
+    Add_FrameHeader
+       Int32       main is here        NET_CYC_SetRealDataCallBack       	wd_reboot       epoll_create       epTimeEventAlloc       init_monitor       	cbTimeout       handleAlarmEvent       sem_dsp_data       doSplit             €ÁÄ /õ       ÆÅ ÇÌ F    ¤  E  é  ¨  {  ;  ø  ³  n  -  è  ¥  ]    Ó   Œ   F       B       =Y:\extern_8127\svn_8127\app\trunk\program\Monitor\cifscheck.cB       =Y:\extern_8127\svn_8127\app\trunk\Main\dsp\dspParamManage.cppC       >Y:\extern_8127\svn_8127\app\trunk\program\DebugShell\dvs_cmd.cB       =Y:\extern_8127\svn_8127\app\trunk\program\update\dvs_update.c@       ;Y:\extern_8127\svn_8127\app\trunk\program\Monitor\monitor.cD       ?Y:\extern_8127\svn_8127\app\trunk\program\xcsConf\confService.c?       :Y:\extern_8127\svn_8127\app\trunk\program\Monitor\epCore.hA       <Y:\extern_8127\svn_8127\app\trunk\program\Monitor\watchdog.h=       8Y:\extern_8127\svn_8127\app\trunk\program\Monitor\main.cA       <Y:\extern_8127\svn_8127\app\trunk\program\Monitor\timeList.hA       <Y:\extern_8127\svn_8127\app\trunk\program\Monitor\timeList.c?       :Y:\extern_8127\svn_8127\app\trunk\program\Monitor\epCore.c<       7Y:\extern_8127\svn_8127\app\trunk\Main\syscall\main.cpp)       $Y:\xcs_8127_si\xcs8127.SearchResults=       8Y:\extern_8127\svn_8127\app\trunk\Main\include\MmsSend.hX       SY:\extern_8127\svn_8127\app\trunk\libSource\newMmsSend-onvif-h264\include\MmsSend.h[       VY:\extern_8127\svn_8127\app\trunk\libSource\newMmsSend-onvif-h264\source\dvs_default.hY       TY:\extern_8127\svn_8127\app\trunk\libSource\newMmsSend-onvif-h264\source\MmsSend.cppA       <Y:\extern_8127\svn_8127\app\trunk\Main\syscall\SysHandle.cpp7       2Y:\extern_8127\svn_8127\app\trunk\Main\dsp\dsp.cpp                      d       ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                `©Æ €~Æ         „   ®   :  œ         °       €~Æ                              ý       ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                HªÆ Ø¥Ä         ,   :   °           °       Ø¥Ä                              ÿ       ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                `ËÉ ÀóÆ                 ý     u       •       ÀóÆ     ˆ   ˆ                                ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                0ÍÉ HæÈ                 Z            À       HæÈ     ô  ô                          È      ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                €ÎÉ 0[          „   ®   °    €               0[      c   c                         u       ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                ÐÏÉ @tÇ         ,   :   ñ  O         °       @tÇ     Ø  Ø                        Z      ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                 ÑÉ ¸^Å         „   ®   ž  A         °       ¸^Å                                             ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                Èoòó        ,   :   4  ¾  c       ƒ       ó    e   e                           e       ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                ÐƒÌó                          °       ó    É   É                         À       ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                Ø-Öø*Ö                  ƒ         °       ø*Ö    ?  ?                          1      ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                ÈòàdÚ        š   Ë   e  Ú  c       ƒ       àdÚ    ˆ   ˆ                                  ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                HÌÉ XwÄ         n   ‘   ­  v         °       XwÄ                                      ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                @½ÉPÅ         „   ®   ý  Œ         °       PÅ                                             ,   ,   €                                              Ø´Ç høÊ         B   W   4  (         °       høÊ     O   O                           F       ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                ¸$ö°3ô        °   è   H  ö         °       °3ô    Q   Q                           H       ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                x¨Æ xºÇ         „   ®   Ã  “  {       ›       xºÇ     +   +                         #       ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                ˜×Ü˜z×        n   ‘   ç  o  u       •       ˜z×    0  0  I   I                         ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                ¨¶Ç (fÇ                 ,  Ñ  ˜       ¸       (fÇ     É  É  1   1                   ¡      ,   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                pÒÉ €.Ê               ô    c       ƒ       €.Ê     Þ   Þ                         È       -   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                    €.Ê               ô    c       ƒ       €.Ê     Þ   Þ                         È       -   ,  ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ                g        g  ÿÿÿÿ¨       ]      Y      V      J      2      R      %                  ö       é       Ø       Ó       Ì       ¿       »       ¶       ¬       yes	wd_rebootmonimonepoll_createmain.cmainepTimeEventAllocinit_monitornewAlarmNode->cbTimeout	cbTimeoutsem_dsp_dataMmsDataWritenode.pSplitter->doSplitdoSplitmmsyeYES	sysHandle             8%Æ híÕ     ›        \    |  t  (  V  )  S  õ   2  Ï   F    ½   C  b          	   	          ¨&  (ÆÅ    n  ³  Ð%Æ ˜ Ï)  Ì      F    ¿   „   @   ‡  <       7Y:\extern_8127\svn_8127\app\trunk\Main\syscall\main.cpp@       ;Y:\extern_8127\svn_8127\app\trunk\Main\protocol\TcpSend.cpp7       2Y:\extern_8127\svn_8127\app\trunk\Main\dsp\dsp.cpp@                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       	  pnal_num=(U    VirtualLoop_feature_t param;
+    memset(&param, 0, sizeof(param));
+	param.chan_id = chanid;
+	param.lane_id = iLaneId;
+	param.bShowFlag = iShowFlag;
+    param.x1 = pParam->startX;
+    param.y1 = pParam->startY;
+    param.x2 = param.x1 + pParam->width;
+    param.y2 = param.y1 + pParam->height;
+    //sem_wait(&sem_dsp);
+    ret = CALL_CYC_CMD(NET_DEV_SET_VIRTUAL_LOOP, param);
+    //sem_post(&sem_dsp);
+    DSP_INFO("Set vl param chan %d (%d %d ),(%d %d ) ret = %d .\n",chanid,param.x1,param.y1,param.x2,param.y2,ret);
+    return ret;
+
+	#endif
+ }
+}
+
+int dspSetRedInfo(int lane)
+{
+    int ret;
+    int iRedFlag =0;
+    /* begin add ¸øDSP´«µÝ³µ¼ìÆ÷ºìµÆÊµ¼Ê×´Ì¬ */
+    char cVehRedLSta = g_EPLaneSwitchInfo[lane].cRedLSta;
+    iRedFlag = cVehRedLSta;
+    iRedFlag <<= 16;
+    /* end add */
+    iRedFlag |= getTrafficLightSta(lane);
+    DSP_INFO("%s %d lane:%d,iRedFlag:0x%x\n",__FUNCTION__,__LINE__,lane,iRedFlag);
+
+	EP_REDLIGHT_FLAG_PARAM param;
+	memset(&param, 0, sizeof(param));
+	param.lane_id = lane;
+	param.bRedFlag = iRedFlag;
+
+    //sem_wait(&sem_dsp);
+    ret = CALL_CYC_CMD(NET_DEV_SET_EP_REDLIGHT_FLAG, param);
+    if(ret != 0)
+    {
+    	syslog(LOG_ERR|LOG_USER, "call NET_DEV_SET_EP_REDLIGHT_FLAG command failed.\n");
+	}
+    //sem_post(&sem_dsp);
+    return ret;
+}
+
+int dspRedLightTimeSet(int chanid,int status)
+{
+    int ret;
+    DSP_INFO("vid %d status %d .\n",chanid,status);
+    struct timeval tv;
+    struct timezone tz;
+
+    gettimeofday (&tv , &tz);
+
+    DSP_INFO("tv_sec:  %d\n", tv.tv_sec + 8*3600) ;
+    DSP_INFO("tv_usec: %d\n", tv.tv_usec);
+
+	NOTIFY_RED_LIGHT_PARAM param;
+	memset(&param, 0, sizeof(NOTIFY_RED_LIGHT_PARAM));
+	param.chan_id = 0;
+	param.lane_id = chanid;
+	param.sec = tv.tv_sec + 8 * 3600;
+	param.msec = tv.tv_usec / 1000;
+    //sem_wait(&sem_dsp);
+    ret = CALL_CYC_CMD(NET_DEV_SET_NOTIFY_RED_LIGHT, param);
+    if(ret < 0)
+    {
+    	syslog(LOG_ERR|LOG_USER, "call NET_DEV_SET_NOTIFY_RED_LIGHT command failed!\n");
+		DSP_ERROR("Call NET_DEV_SET_NOTIFY_RED_LIGHT command failed, error code: %d.\n", NET_DVE_GetLastError());
+    }
+    //sem_post(&sem_dsp);
+
+    return ret;
+}
+
+int DspAppDebugSwitch(int level)
+{ 
+    g_dsp_debug_module = level;
+    return 0;
+}
+
+int dspUnInit()
+{
+   dspEncStaCtl(0,0);
+   NET_CYC_Stop();
+   NET_CYC_Cleanup();
+   sem_destroy(&sem_dsp);
+   sem_destroy(&sem_dsp_data);
+   return 0;
+} 
+
+int dspReset()
+{
+    dspUnInit();
+    dspInit();
+    return 0;
+}
+
+int dspPrintVer()
+{
+    shell_print("dsp_sharelib version=%x, compile info:%s, description: %s.\n", sharelib_version_info.version, sharelib_version_info.szCompile, sharelib_version_info.szDesc);
+    shell_print("dsp_firmware version=%x, compile info:%s, description: %s.\n", firmware_version_info.version, firmware_version_info.szCompile, firmware_version_info.szDesc);
+	shell_print("link_epolice version info:%s.\n", link_ep_version_info.szCompile);
+	shell_print("link_lpr version info:%s.\n", link_lpr_version_info.szCompile);
+	shell_print("link_osd version info:%s.\n", link_osd_version_info.szCompile);
+	shell_print("link_redlight version info:%s.\n", link_rlt_version_info.szCompile);
+    return 0;
+}
+
+int getCameraInfo(int *pWidth,int *pHeight,int *pPixels)
+{
+    if ( (NULL == pWidth) || (NULL == pHeight) || (NULL == pPixels) )
+    {
+        return -1;
+    }
+    *pWidth = HDConf.image_width;
+    *pHeight = HDConf.image_height;
+    *pPixels = HDConf.totalpixels/10000;
+    if(*pWidth == 0)
+    {
+        *pWidth = 1600;
+    }
+    if(*pHeight == 0)
+    {
+        *pHeight = 1216;
+    }
+    if(*pPixels == 0)
+    {
+        *pPixels = 200;
+    }
+    return 0;
+}
+
+int dspSetSnapArea(int vid,int startX,int startY,int width,int height, int iShowFlag)
+{
+    int ret;
+    HSLRECT rect;
+    memset(&rect, 0, sizeof(rect));
+    
+	rect.chan_id = 0;
+	rect.lane_id = vid;
+    rect.startX = startX;
+    rect.startY = startY;
+    rect.width = width;
+    rect.height = height;
+    rect.bShow = iShowFlag;
+    DSP_INFO("X %d Y %d width %d height %d. showFlag:%d\n",rect.startX,rect.startY,rect.width,rect.height, rect.bShow);
+    //sem_wait(&sem_dsp);
+    ret = CALL_CYC_CMD(NET_DEV_SET_GT5000_SNAPSHOT_SIZE_SET, rect);
+    if ( ret != 0)
+    {
+        DSP_ERROR("%s %d return failed .\n",__FUNCTION__,__LINE__);
+    }
+    //sem_post(&sem_dsp);
+    return ret;
+}
+
+
