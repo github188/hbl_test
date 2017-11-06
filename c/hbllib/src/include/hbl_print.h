@@ -82,6 +82,10 @@ do {\
   }\
 }while(0)
 
+
+#define debug(char *format,...) hbl_print(HBL_DEBUG,HBL_PRINTF,NULL,format,##__VA_ARGS__)
+#define print(char *format,...) hbl_print(HBL_PRINT,HBL_PRINTF,NULL,format,##__VA_ARGS__)
+
 #endif
 
 #endif
